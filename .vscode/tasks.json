@@ -1,0 +1,25 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Reading Desk: 開發",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/run.ps1 dev",
+      "problemMatcher": []
+    },
+    {
+      "label": "Reading Desk: 建置",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/run.ps1 build",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "Reading Desk: 測試",
+      "type": "shell",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/run.ps1 test",
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}
