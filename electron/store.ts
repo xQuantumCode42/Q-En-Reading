@@ -1,6 +1,16 @@
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import {
+  localDay,
+  dailyRecommendationSchema,
+  recommendationSettingsSchema,
+  defaultRecommendationSettings,
+  articleBookmarkSchema,
+  type ArticleBookmark,
+  type DailyRecommendation,
+  type RecommendationSettings,
+} from "../shared/recommendations";
+import {
   backupSchema,
   defaultPreferences,
   type Article,
@@ -53,6 +63,57 @@ export class Store {
       .prepare("INSERT OR REPLACE INTO settings VALUES('preferences',?)")
       .run(JSON.stringify(p));
   }
+  recommendationSettings(): RecommendationSettings {
+    const row = this.db
+      .prepare("SELECT value FROM settings WHERE key='recommendation-settings'")
+      .get();
+    return row
+      ? recommendationSettingsSchema.parse(JSON.parse(row.value as string))
+      : defaultRecommendationSettings;
+  }
+  setRecommendationSettings(settings: RecommendationSettings) {
+    this.db
+      .prepare(
+        "INSERT OR REPLACE INTO settings VALUES('recommendation-settings',?)",
+      )
+      .run(JSON.stringify(recommendationSettingsSchema.parse(settings)));
+  }
+  dailyRecommendation(day: string): DailyRecommendation | undefined {
+    const record = this.get("recommendation", day);
+    return record ? dailyRecommendationSchema.parse(record) : undefined;
+  }
+  saveRecommendation(
+    value: DailyRecommendation,
+    replace = false,
+  ): DailyRecommendation {
+    const record = dailyRecommendationSchema.parse(value);
+    this.db
+      .prepare(
+        replace
+          ? "INSERT OR REPLACE INTO records(type,id,data) VALUES('recommendation',?,?)"
+          : "INSERT OR IGNORE INTO records(type,id,data) VALUES('recommendation',?,?)",
+      )
+      .run(record.day, JSON.stringify(record));
+    return this.dailyRecommendation(record.day)!;
+  }
+  saveArticleBookmark(value: DailyRecommendation): ArticleBookmark {
+    const recommendation = dailyRecommendationSchema.parse(value);
+    const bookmark = articleBookmarkSchema.parse({
+      url: recommendation.url,
+      title: recommendation.title,
+      reasonChinese: recommendation.reasonChinese,
+      recommendedDay: recommendation.day,
+      createdAt: new Date().toISOString(),
+    });
+    this.db
+      .prepare(
+        "INSERT OR IGNORE INTO records(type,id,data) VALUES('article-bookmark',?,?)",
+      )
+      .run(bookmark.url, JSON.stringify(bookmark));
+    return articleBookmarkSchema.parse(
+      this.get("article-bookmark", bookmark.url),
+    );
+  }
   transaction(fn: () => void) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -84,15 +145,37 @@ export class Store {
       analyses: this.list<Analysis>("analysis"),
       favorites: this.list<Favorite>("favorite"),
       preferences: this.preferences(),
+      recommendationSettings: this.recommendationSettings(),
+      recommendations: this.list<DailyRecommendation>("recommendation"),
+      articleBookmarks: this.list<ArticleBookmark>("article-bookmark"),
     });
   }
-  restore(value: unknown, mode: "merge" | "replace") {
+  restore(value: unknown, mode: "merge" | "replace", today = localDay()) {
     const b = backupSchema.parse(value);
+    const lockedToday = this.dailyRecommendation(today);
+    const localSettingsExist = !!this.db
+      .prepare("SELECT key FROM settings WHERE key='recommendation-settings'")
+      .get();
     this.transaction(() => {
       if (mode === "replace") {
         this.db.exec("DELETE FROM records");
         this.setPreferences(b.preferences);
       }
+      if (lockedToday) this.saveRecommendation(lockedToday);
+      for (const bookmark of b.articleBookmarks ?? []) {
+        this.db
+          .prepare(
+            "INSERT OR IGNORE INTO records(type,id,data) VALUES('article-bookmark',?,?)",
+          )
+          .run(bookmark.url, JSON.stringify(bookmark));
+      }
+      for (const recommendation of b.recommendations ?? [])
+        this.saveRecommendation(recommendation);
+      if (
+        b.recommendationSettings &&
+        (mode === "replace" || !localSettingsExist)
+      )
+        this.setRecommendationSettings(b.recommendationSettings);
       // Merge preserves all local data. Colliding article/analysis/favorite IDs are remapped together.
       const articleIds = new Map(
         b.articles.map((a) => [

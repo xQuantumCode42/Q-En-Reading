@@ -21,7 +21,26 @@ async function launch() {
   return page;
 }
 async function installFixtures() {
-  await app.evaluate(({ shell }) => {
+  await app.evaluate(({ shell, app }) => {
+    const path = process.getBuiltinModule("node:path");
+    const loader = process
+      .getBuiltinModule("node:module")
+      .createRequire(path.join(app.getAppPath(), "package.json"));
+    const importer = loader("./dist-electron/electron/article-import.js");
+    globalThis.importHang = false;
+    globalThis.importFail = false;
+    importer.ArticleImporter.prototype.import = async (url, signal) => {
+      if (globalThis.importHang) return new Promise(() => {});
+      if (globalThis.importFail)
+        throw new Error("Unable to import public article fixture");
+      const text =
+        "The proposal gained traction among residents. Reading in context helps build understanding. Communities have worked together to plant trees and make their streets cooler during the summer. The project gives neighbors new opportunities to care for the places they share.";
+      return importer.extractArticleInWorker(
+        `<html><head><title>Imported public article</title></head><body><article><h1>Imported public article</h1><p>${text}</p><p>${text}</p><p>${text}</p></article></body></html>`,
+        url,
+        signal,
+      );
+    };
     const crypto = process.getBuiltinModule("node:crypto");
     const pair = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
     const jwk = pair.publicKey.export({ format: "jwk" });
@@ -33,6 +52,10 @@ async function installFixtures() {
         globalThis.testUsageUrl = url;
         return;
       }
+      if (parsed.hostname === "www.npr.org") {
+        globalThis.testArticleUrl = url;
+        return;
+      }
       nonce = parsed.searchParams.get("nonce");
       const callback = new URL(parsed.searchParams.get("redirect_uri"));
       callback.searchParams.set("state", parsed.searchParams.get("state"));
@@ -41,6 +64,10 @@ async function installFixtures() {
       await network(callback);
     };
     globalThis.testAICalls = 0;
+    globalThis.testSearchCalls = 0;
+    globalThis.testRefreshFail = false;
+    globalThis.testRefreshHang = false;
+    globalThis.testRefreshSame = false;
     globalThis.fetch = async (value, init) => {
       const url = String(value);
       if (url.endsWith("/.well-known/jwks.json"))
@@ -98,7 +125,6 @@ async function installFixtures() {
         return new Response(null, { status: 200 });
       if (!url.endsWith("/responses"))
         throw new Error("Unexpected network request");
-      globalThis.testAICalls++;
       const request = JSON.parse(init.body);
       if (
         request.stream !== true ||
@@ -107,6 +133,58 @@ async function installFixtures() {
         init.headers.Authorization !== "Bearer fixture-subscription-access"
       )
         throw new Error("Invalid subscription request");
+      if (request.tools?.some((tool) => tool.type === "web_search")) {
+        globalThis.testSearchCalls++;
+        globalThis.testSearchInput = request.input;
+        if (globalThis.testRefreshFail)
+          throw new Error("Refresh fixture unavailable");
+        if (globalThis.testRefreshHang) return new Promise(() => {});
+        const { localDate: day, excludedUrls = [] } = JSON.parse(
+          request.input[0].content,
+        );
+        const article = {
+          title: excludedUrls.length
+            ? `A fresh article ${globalThis.testSearchCalls}`
+            : "A greener city, one tree at a time",
+          url: globalThis.testRefreshSame
+            ? excludedUrls[0]
+            : excludedUrls.length
+              ? `https://www.npr.org/sections/science/refreshed-${globalThis.testSearchCalls}`
+              : "https://www.npr.org/sections/science/daily-reading-fixture",
+          publishedDate: day,
+          reasonChinese: "城市與自然的報導，適合一般成人原文閱讀。",
+        };
+        return new Response(
+          "data: " +
+            JSON.stringify({
+              type: "response.completed",
+              response: {
+                status: "completed",
+                output: [
+                  {
+                    type: "web_search_call",
+                    status: "completed",
+                    action: { type: "search", sources: [{ url: article.url }] },
+                  },
+                  {
+                    type: "message",
+                    content: [
+                      {
+                        type: "output_text",
+                        text: JSON.stringify(article),
+                        annotations: [
+                          { type: "url_citation", url: article.url },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            }) +
+            "\n\n",
+        );
+      }
+      globalThis.testAICalls++;
       const input = JSON.parse(request.input[0].content);
       const item = {
         term: "gained traction",
@@ -258,6 +336,18 @@ async function installFixtures() {
     await page.getByRole("button", { name: /設定/ }).click();
     assert.equal(await page.getByLabel("API Key", { exact: true }).count(), 0);
     await page
+      .getByLabel("收藏英文網站", { exact: true })
+      .fill(
+        "https://www.npr.org/sections/science/\nhttps://www.smithsonianmag.com/",
+      );
+    await page
+      .getByRole("button", { name: "保存推薦設定", exact: true })
+      .click();
+    await page
+      .getByRole("status")
+      .filter({ hasText: "推薦設定已保存" })
+      .waitFor();
+    await page
       .getByRole("button", { name: "Continue with ChatGPT", exact: true })
       .click();
     await page
@@ -292,6 +382,63 @@ async function installFixtures() {
       path: path.join(directory, "subscription-settings.png"),
     });
     await page.getByRole("button", { name: /文章庫/ }).click();
+    await page
+      .getByRole("link", {
+        name: "A greener city, one tree at a time",
+        exact: true,
+      })
+      .waitFor();
+    assert.equal(await app.evaluate(() => globalThis.testSearchCalls), 1);
+    const aiBeforeBookmark = await app.evaluate(() => globalThis.testAICalls);
+    await page.getByRole("button", { name: "☆ 收藏文章", exact: true }).click();
+    await page
+      .getByRole("button", { name: "★ 已收藏文章", exact: true })
+      .waitFor();
+    await page.evaluate(async () => {
+      const { recommendation } = await window.readingDesk.snapshot();
+      await Promise.all([
+        window.readingDesk.bookmarkRecommendation(recommendation.day),
+        window.readingDesk.bookmarkRecommendation(recommendation.day),
+      ]);
+    });
+    assert.equal(
+      await page.evaluate(
+        async () =>
+          (await window.readingDesk.snapshot()).articleBookmarks.length,
+      ),
+      1,
+    );
+    assert.equal(
+      await app.evaluate(() => globalThis.testAICalls),
+      aiBeforeBookmark,
+    );
+    assert.ok(
+      JSON.stringify(
+        await app.evaluate(() => globalThis.testSearchInput),
+      ).includes("www.npr.org"),
+    );
+    assert.ok(
+      !JSON.stringify(
+        await app.evaluate(() => globalThis.testSearchInput),
+      ).includes("Desktop persistence test"),
+    );
+    await page
+      .getByRole("link", {
+        name: "A greener city, one tree at a time",
+        exact: true,
+      })
+      .click();
+    assert.equal(
+      await app.evaluate(() => globalThis.testArticleUrl),
+      "https://www.npr.org/sections/science/daily-reading-fixture",
+    );
+    await page.evaluate(async () => {
+      await Promise.all([
+        window.readingDesk.recommendation(true),
+        window.readingDesk.recommendation(false),
+      ]);
+    });
+    assert.equal(await app.evaluate(() => globalThis.testSearchCalls), 1);
     await page.getByRole("button", { name: "字詞解析", exact: true }).click();
     await page
       .locator(".term-line h3")
@@ -351,6 +498,22 @@ async function installFixtures() {
     await page.screenshot({ path: path.join(directory, "reading.png") });
     await app.close();
     page = await launch();
+    await page
+      .getByRole("button", { name: "★ 已收藏文章", exact: true })
+      .waitFor();
+    assert.equal(
+      await page.evaluate(
+        async () =>
+          (await window.readingDesk.snapshot()).articleBookmarks.length,
+      ),
+      1,
+    );
+    await page
+      .getByRole("link", {
+        name: "A greener city, one tree at a time",
+        exact: true,
+      })
+      .waitFor();
     assert.equal(
       await page.evaluate(
         async () => (await window.readingDesk.snapshot()).chatGPT.sharing,
@@ -398,6 +561,7 @@ async function installFixtures() {
       true,
     );
     const content = JSON.parse(fs.readFileSync(backup, "utf8"));
+    assert.equal(content.articleBookmarks.length, 1);
     assert.equal(content.favorites[0].note, "重開後仍要保留的筆記");
     assert.ok(!JSON.stringify(content).includes("fixture-subscription-access"));
     assert.equal(
@@ -417,6 +581,13 @@ async function installFixtures() {
     assert.equal(
       await page.evaluate(
         async () => (await window.readingDesk.snapshot()).articles.length,
+      ),
+      1,
+    );
+    assert.equal(
+      await page.evaluate(
+        async () =>
+          (await window.readingDesk.snapshot()).articleBookmarks.length,
       ),
       1,
     );
@@ -447,6 +618,206 @@ async function installFixtures() {
     });
     assert.deepEqual(errors, []);
     await installFixtures();
+    const beforeImport = await page.evaluate(
+      async () => (await window.readingDesk.snapshot()).articles.length,
+    );
+    await page
+      .getByRole("button", { name: "＋ 新增文章", exact: true })
+      .click();
+    await page
+      .getByLabel("來源網址", { exact: true })
+      .fill("https://example.com/public-article");
+    await page.getByRole("button", { name: "儲存並開始閱讀 →" }).click();
+    await page
+      .getByRole("heading", { name: "Imported public article", exact: true })
+      .waitFor();
+    const imported = await page.evaluate(async () =>
+      (await window.readingDesk.snapshot()).articles.find(
+        (a) => a.title === "Imported public article",
+      ),
+    );
+    assert.ok(imported.body.length > 200);
+    assert.equal(imported.source, "https://example.com/public-article");
+    await page.locator(".original-text").evaluate((element) => {
+      const text = element.firstChild;
+      const start = text.textContent.indexOf("gained traction");
+      const range = document.createRange();
+      range.setStart(text, start);
+      range.setEnd(text, start + 15);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    });
+    await page.getByRole("button", { name: "字詞解析", exact: true }).click();
+    await page
+      .locator(".term-line h3")
+      .filter({ hasText: "gained traction" })
+      .waitFor();
+    await app.evaluate(() => {
+      globalThis.importFail = true;
+    });
+    await page
+      .getByRole("button", { name: "＋ 新增文章", exact: true })
+      .click();
+    const sourceInput = page.getByLabel("來源網址", { exact: true });
+    await sourceInput.fill("https://example.com/failure");
+    await page.getByRole("button", { name: "儲存並開始閱讀 →" }).click();
+    await page
+      .getByRole("alert")
+      .filter({ hasText: "Unable to import public article fixture" })
+      .waitFor();
+    assert.equal(await sourceInput.inputValue(), "https://example.com/failure");
+    await app.evaluate(() => {
+      globalThis.importFail = false;
+      globalThis.importHang = true;
+    });
+    await page.getByRole("button", { name: "儲存並開始閱讀 →" }).click();
+    await page.getByRole("button", { name: "取消擷取", exact: true }).click();
+    await page.getByRole("alert").filter({ hasText: "已取消擷取" }).waitFor();
+    assert.equal(await sourceInput.inputValue(), "https://example.com/failure");
+    assert.equal(
+      await page.evaluate(
+        async () => (await window.readingDesk.snapshot()).articles.length,
+      ),
+      beforeImport + 1,
+    );
+    await page
+      .getByRole("button", { name: "關閉新增文章", exact: true })
+      .click();
+    await app.evaluate(() => {
+      globalThis.importHang = false;
+    });
+    await page.getByRole("button", { name: /星號收藏/ }).click();
+    await page.getByRole("button", { name: /文章收藏（/ }).click();
+    await page
+      .getByRole("heading", {
+        name: "A greener city, one tree at a time",
+        exact: true,
+      })
+      .waitFor();
+    await page.screenshot({
+      path: path.join(directory, "article-bookmarks.png"),
+    });
+    await page.getByRole("button", { name: "開啟原文", exact: true }).click();
+    assert.equal(
+      await app.evaluate(() => globalThis.testArticleUrl),
+      "https://www.npr.org/sections/science/daily-reading-fixture",
+    );
+    await app.evaluate(() => {
+      globalThis.importFail = true;
+    });
+    await page.getByRole("button", { name: "匯入閱讀", exact: true }).click();
+    await page
+      .getByRole("alert")
+      .filter({ hasText: "Unable to import public article fixture" })
+      .waitFor();
+    assert.equal(
+      await page.evaluate(
+        async () =>
+          (await window.readingDesk.snapshot()).articleBookmarks.length,
+      ),
+      1,
+    );
+    await app.evaluate(() => {
+      globalThis.importFail = false;
+    });
+    await page.getByRole("button", { name: "匯入閱讀", exact: true }).click();
+    await page
+      .locator(".original-text")
+      .filter({ hasText: "gained traction" })
+      .waitFor();
+    await page.getByRole("button", { name: /星號收藏/ }).click();
+    await page.getByRole("button", { name: "取消收藏", exact: true }).click();
+    await page
+      .getByRole("button", { name: "確認取消收藏", exact: true })
+      .click();
+    await page
+      .getByRole("heading", { name: "尚無符合的文章收藏", exact: true })
+      .waitFor();
+    await page.getByRole("button", { name: /文章庫/ }).click();
+    const card = page.locator(".daily-card");
+    await card.getByRole("button", { name: "☆ 收藏文章", exact: true }).click();
+    await card
+      .getByRole("button", { name: "★ 已收藏文章", exact: true })
+      .waitFor();
+    await card
+      .getByRole("button", { name: "↻ 刷新今日推薦", exact: true })
+      .click();
+    await card.getByRole("link", { name: /A fresh article/ }).waitFor();
+    const freshTitle = await card.locator(".daily-title").innerText();
+    const freshUrl = await card.locator(".daily-title").getAttribute("href");
+    const sentInput = JSON.parse(
+      (await app.evaluate(() => globalThis.testSearchInput))[0].content,
+    );
+    assert.deepEqual(sentInput.excludedUrls, [
+      "https://www.npr.org/sections/science/daily-reading-fixture",
+    ]);
+    assert.equal(
+      await page.evaluate(
+        async () =>
+          (await window.readingDesk.snapshot()).articleBookmarks[0].url,
+      ),
+      "https://www.npr.org/sections/science/daily-reading-fixture",
+    );
+    await card
+      .getByRole("button", { name: "☆ 收藏文章", exact: true })
+      .waitFor();
+    await app.evaluate(() => {
+      globalThis.testRefreshSame = true;
+    });
+    await card
+      .getByRole("button", { name: "↻ 刷新今日推薦", exact: true })
+      .click();
+    await card.getByRole("alert").filter({ hasText: "相同文章" }).waitFor();
+    assert.equal(
+      await card.locator(".daily-title").getAttribute("href"),
+      freshUrl,
+    );
+    await app.evaluate(() => {
+      globalThis.testRefreshSame = false;
+      globalThis.testRefreshFail = true;
+    });
+    await card
+      .getByRole("button", { name: "↻ 刷新今日推薦", exact: true })
+      .click();
+    await card
+      .getByRole("alert")
+      .filter({ hasText: "Refresh fixture unavailable" })
+      .waitFor();
+    assert.equal(
+      await card.locator(".daily-title").getAttribute("href"),
+      freshUrl,
+    );
+    await app.evaluate(() => {
+      globalThis.testRefreshFail = false;
+      globalThis.testRefreshHang = true;
+    });
+    await card
+      .getByRole("button", { name: "↻ 刷新今日推薦", exact: true })
+      .click();
+    await card.getByRole("button", { name: "取消搜尋", exact: true }).click();
+    await card.getByRole("alert").filter({ hasText: "已取消搜尋" }).waitFor();
+    assert.equal(
+      await card.locator(".daily-title").getAttribute("href"),
+      freshUrl,
+    );
+    await page.screenshot({
+      path: path.join(directory, "refresh-preserved.png"),
+    });
+    await app.close();
+    page = await launch();
+    await page
+      .locator(".daily-title")
+      .filter({ hasText: freshTitle })
+      .waitFor();
+    assert.equal(
+      await page.locator(".daily-title").getAttribute("href"),
+      freshUrl,
+    );
+    await installFixtures();
+    await page.evaluate(() => window.readingDesk.recommendation(true));
+    assert.equal(await app.evaluate(() => globalThis.testSearchCalls), 0);
     await page.getByRole("button", { name: /設定/ }).click();
     await page.getByRole("button", { name: "登出", exact: true }).click();
     await page
@@ -454,7 +825,7 @@ async function installFixtures() {
       .filter({ hasText: "尚未登入 ChatGPT" })
       .waitFor();
     console.log(
-      "PASS: Electron OAuth/subscription/model picker/SSE/cache/sign-out/encryption/reopen/article/favorite/note/position/backup/security",
+      "PASS: Electron OAuth/subscription/search/citations/daily cache/manual refresh/exclusions/same URL rejection/failure/cancel/reopen/model picker/SSE/cache/sign-out/encryption/article/favorite/note/position/backup/security/URL import/analysis/failure/cancel/article bookmarks/reopen/dedup/backup/import/remove",
     );
     console.log("Artifacts:", directory);
   } finally {

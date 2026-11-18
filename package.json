@@ -21,12 +21,16 @@
     "pack:dir": "npm run build && electron-builder --dir"
   },
   "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "ipaddr.js": "^2.5.0",
     "jose": "^6.2.16",
+    "jsdom": "^26.1.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
+    "@types/jsdom": "^21.1.7",
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",

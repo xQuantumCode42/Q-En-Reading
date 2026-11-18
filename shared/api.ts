@@ -1,4 +1,9 @@
 import type { Article, Analysis, Favorite, Kind, Preferences } from "./schema";
+import type {
+  RecommendationSettings,
+  RecommendationState,
+  ArticleBookmark,
+} from "./recommendations";
 export type ChatGPTSession = {
   profiles: {
     id: string;
@@ -26,14 +31,26 @@ export type Snapshot = {
   preferences: Preferences;
   chatGPT: ChatGPTSession;
   dataPath: string;
+  recommendationSettings: RecommendationSettings;
+  recommendation: RecommendationState;
+  articleBookmarks: ArticleBookmark[];
 };
 export interface API {
   snapshot(): Promise<Snapshot>;
+  recommendation(retry?: boolean): Promise<RecommendationState>;
+  refreshRecommendation(): Promise<RecommendationState>;
+  cancelRecommendation(): Promise<void>;
+  recommendationSettings(input: RecommendationSettings): Promise<void>;
+  openRecommendation(day: string): Promise<void>;
+  bookmarkRecommendation(day: string): Promise<ArticleBookmark>;
+  deleteArticleBookmark(url: string): Promise<void>;
+  openArticleBookmark(url: string): Promise<void>;
   addArticle(input: {
     title: string;
     source: string;
     body: string;
   }): Promise<Article>;
+  cancelArticleImport(): Promise<void>;
   renameArticle(input: { id: string; title: string }): Promise<void>;
   deleteArticle(id: string): Promise<void>;
   position(input: { id: string; position: number }): Promise<void>;

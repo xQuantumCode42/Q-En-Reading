@@ -1,4 +1,9 @@
 import { z } from "zod";
+import {
+  dailyRecommendationSchema,
+  recommendationSettingsSchema,
+  articleBookmarkSchema,
+} from "./recommendations";
 export const text = z.string().max(100000);
 export const id = z.string().uuid();
 export const kindSchema = z.enum(["word", "sentence", "overview"]);
@@ -84,6 +89,25 @@ export const articleSchema = z
   })
   .strict();
 export type Article = z.infer<typeof articleSchema>;
+export const articleInputSchema = z
+  .object({
+    title: z.string().trim().max(300),
+    source: sourceSchema,
+    body: z.string().max(200000),
+  })
+  .strict()
+  .superRefine((input, context) => {
+    if (!input.body.trim() && !input.source.trim())
+      context.addIssue({
+        code: "custom",
+        message: "請貼上文章正文或輸入文章網址。",
+      });
+    if (input.body.trim() && !input.title.trim())
+      context.addIssue({
+        code: "custom",
+        message: "貼上正文時請填寫文章標題。",
+      });
+  });
 export const analysisSchema = z
   .object({
     id,
@@ -140,9 +164,22 @@ export const backupSchema = z
     analyses: z.array(analysisSchema).max(50000),
     favorites: z.array(favoriteSchema).max(50000),
     preferences: preferencesSchema,
+    recommendationSettings: recommendationSettingsSchema.optional(),
+    recommendations: z.array(dailyRecommendationSchema).max(5000).optional(),
+    articleBookmarks: z.array(articleBookmarkSchema).max(10000).optional(),
   })
   .strict()
   .superRefine((b, ctx) => {
+    if (
+      new Set(b.articleBookmarks?.map((item) => item.url)).size !==
+      (b.articleBookmarks?.length ?? 0)
+    )
+      ctx.addIssue({ code: "custom", message: "文章收藏有重複網址" });
+    if (
+      new Set(b.recommendations?.map((item) => item.day)).size !==
+      (b.recommendations?.length ?? 0)
+    )
+      ctx.addIssue({ code: "custom", message: "推薦紀錄有重複日期" });
     for (const key of ["articles", "analyses", "favorites"] as const)
       if (new Set(b[key].map((x) => x.id)).size !== b[key].length)
         ctx.addIssue({ code: "custom", message: `${key} 有重複 ID` });

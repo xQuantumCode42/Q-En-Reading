@@ -275,6 +275,7 @@ export async function readResponsesStream(
   response: Response,
   signal?: AbortSignal,
   onProgress?: (phase: AnalysisPhase, characters: number) => void,
+  onCompleted?: (response: unknown) => void,
 ): Promise<string> {
   if (!response.body) throw new Error("AI 沒有回傳串流內容，請重試。");
   const reader = response.body.getReader();
@@ -282,6 +283,7 @@ export async function readResponsesStream(
   let buffer = "";
   let total = 0;
   let characters = 0;
+  const finishedItems = new Map<number, unknown>();
   const consume = (frame: string): string | undefined => {
     const data = frame
       .split("\n")
@@ -300,9 +302,12 @@ export async function readResponsesStream(
         type: z.string(),
         response: z.unknown().optional(),
         delta: z.string().optional(),
-        item: z.object({ type: z.string() }).optional(),
+        item: z.object({ type: z.string() }).passthrough().optional(),
+        output_index: z.number().int().min(0).max(1000).optional(),
       })
       .parse(value);
+    if (event.type === "response.output_item.done" && event.item)
+      finishedItems.set(event.output_index ?? finishedItems.size, event.item);
     if (
       event.type === "response.output_item.added" &&
       event.item?.type === "reasoning"
@@ -317,6 +322,19 @@ export async function readResponsesStream(
     if (event.type === "response.incomplete")
       throw new Error("AI 未完成回應，請縮短文章後重試。");
     if (event.type !== "response.completed") return;
+    const terminal = z
+      .object({ status: z.string(), output: z.array(z.unknown()) })
+      .passthrough()
+      .safeParse(event.response);
+    const responseWithOutput =
+      terminal.success && terminal.data.output.length === 0
+        ? {
+            ...terminal.data,
+            output: [...finishedItems.entries()]
+              .sort(([left], [right]) => left - right)
+              .map(([, item]) => item),
+          }
+        : event.response;
     const completed = z
       .object({
         status: z.literal("completed"),
@@ -330,9 +348,10 @@ export async function readResponsesStream(
           }),
         ),
       })
-      .safeParse(event.response);
+      .safeParse(responseWithOutput);
     if (!completed.success)
       throw new Error("AI 完成事件格式不正確，尚未保存。");
+    onCompleted?.(responseWithOutput);
     return completed.data.output
       .flatMap((item) => item.content ?? [])
       .filter((item) => item.type === "output_text")

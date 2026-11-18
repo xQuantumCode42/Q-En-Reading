@@ -8,7 +8,13 @@ import type {
   Preferences,
 } from "../shared/schema";
 import { defaultPreferences } from "../shared/schema";
+import { ArticleBookmarks } from "./ArticleBookmarks";
 import type { Snapshot, ChatGPTModel, AnalysisProgress } from "../shared/api";
+import { localDay, type RecommendationState } from "../shared/recommendations";
+import {
+  DailyRecommendation,
+  RecommendationSettingsEditor,
+} from "./DailyRecommendation";
 
 const api = window.readingDesk;
 const labels: Record<Kind, string> = {
@@ -20,6 +26,10 @@ type Selection = { text: string; start: number; end: number; sentence: string };
 const emptySelection: Selection = { text: "", start: 0, end: 0, sentence: "" };
 export default function App() {
   const [data, setData] = useState<Snapshot>();
+  const [daily, setDaily] = useState<RecommendationState>();
+  const dailyRef = useRef(daily);
+  dailyRef.current = daily;
+  const dailyPending = useRef<string | undefined>(undefined);
   const [page, setPage] = useState<"library" | "favorites" | "settings">(
     "library",
   );
@@ -52,6 +62,7 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
   const [tagFilter, setTagFilter] = useState("");
+  const [favoriteTab, setFavoriteTab] = useState<"words" | "articles">("words");
   const [editing, setEditing] = useState<Favorite>();
   const [draftNote, setDraftNote] = useState("");
   const [draftTags, setDraftTags] = useState("");
@@ -73,6 +84,7 @@ export default function App() {
   async function refresh() {
     const d = await api.snapshot();
     setData(d);
+    setDaily(d.recommendation);
     return d;
   }
   async function action(fn: () => Promise<unknown>) {
@@ -91,6 +103,60 @@ export default function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = prefs.theme;
   }, [prefs.theme]);
+  async function loadDaily(retry = false, replace = false) {
+    const day = localDay();
+    if (dailyPending.current === day) return;
+    dailyPending.current = day;
+    setDaily((current) =>
+      current?.day === localDay() && current.recommendation
+        ? replace
+          ? { ...current, status: "searching", error: undefined }
+          : current
+        : { day: localDay(), status: "searching" },
+    );
+    try {
+      const result = replace
+        ? await api.refreshRecommendation()
+        : await api.recommendation(retry);
+      if (dailyPending.current === day && result.day === localDay())
+        setDaily(result);
+    } catch (error) {
+      if (dailyPending.current === day && day === localDay())
+        setDaily((current) => ({
+          day: localDay(),
+          status: "error",
+          recommendation:
+            current?.day === day ? current.recommendation : undefined,
+          error: (error as Error).message,
+        }));
+    } finally {
+      if (dailyPending.current === day) dailyPending.current = undefined;
+    }
+  }
+  useEffect(() => {
+    const check = () => {
+      if (!data?.chatGPT.sharing || !data.recommendationSettings.enabled)
+        return;
+      const current = dailyRef.current;
+      if (
+        current?.day === localDay() &&
+        ["ready", "searching", "error"].includes(current.status)
+      )
+        return;
+      void loadDaily();
+    };
+    check();
+    window.addEventListener("focus", check);
+    const interval = setInterval(check, 60000);
+    return () => {
+      window.removeEventListener("focus", check);
+      clearInterval(interval);
+    };
+  }, [
+    data?.chatGPT.sharing,
+    data?.chatGPT.activeProfileId,
+    data?.recommendationSettings.enabled,
+  ]);
   function flushPosition() {
     if (positionTimer.current) clearTimeout(positionTimer.current);
     if (pendingPosition.current) {
@@ -305,7 +371,8 @@ export default function App() {
                 <b>
                   {p === "library"
                     ? (data?.articles.length ?? 0)
-                    : (data?.favorites.length ?? 0)}
+                    : (data?.favorites.length ?? 0) +
+                      (data?.articleBookmarks.length ?? 0)}
                 </b>
               )}
             </button>
@@ -357,6 +424,32 @@ export default function App() {
             <button onClick={() => setNotice("")}>關閉</button>
           </div>
         )}
+        {data && page === "library" && (
+          <DailyRecommendation
+            state={daily}
+            connected={data.chatGPT.sharing}
+            enabled={data.recommendationSettings.enabled}
+            compact={!!article}
+            onRetry={() => void loadDaily(true)}
+            onRefresh={() => void loadDaily(true, true)}
+            onCancel={() => void action(() => api.cancelRecommendation())}
+            onSettings={() => setPage("settings")}
+            onOpen={(day) => void action(() => api.openRecommendation(day))}
+            bookmarked={
+              !!daily?.recommendation &&
+              data.articleBookmarks.some(
+                (b) => b.url === daily.recommendation!.url,
+              )
+            }
+            onBookmark={async (day) => {
+              await action(async () => {
+                await api.bookmarkRecommendation(day);
+                await refresh();
+                setNotice("已收藏文章，可在「星號收藏 → 文章收藏」找回。");
+              });
+            }}
+          />
+        )}
         {!data ? (
           <div className="empty">
             <h2>正在開啟閱讀空間…</h2>
@@ -400,59 +493,120 @@ export default function App() {
                 <h2>把理解，留下來。</h2>
                 <p>每個語境都值得獨立記錄。</p>
               </div>
-              <span>{data.favorites.length} 筆收藏</span>
+              <span>
+                {data.favorites.length + data.articleBookmarks.length} 筆收藏
+              </span>
             </div>
-            <div className="search-row">
-              <input
-                aria-label="搜尋收藏"
-                placeholder="搜尋字詞、意思、來源或筆記…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-              />
-              <select
-                aria-label="標籤篩選"
-                value={tagFilter}
-                onChange={(e) => setTagFilter(e.target.value)}
+            <div className="bookmark-actions" aria-label="收藏分類">
+              <button
+                aria-pressed={favoriteTab === "words"}
+                onClick={() => setFavoriteTab("words")}
               >
-                <option value="">所有標籤</option>
-                {Array.from(new Set(data.favorites.flatMap((f) => f.tags))).map(
-                  (t) => (
-                    <option key={t}>{t}</option>
-                  ),
-                )}
-              </select>
+                字詞收藏（{data.favorites.length}）
+              </button>
+              <button
+                aria-pressed={favoriteTab === "articles"}
+                onClick={() => {
+                  setFavoriteTab("articles");
+                  setTagFilter("");
+                }}
+              >
+                文章收藏（{data.articleBookmarks.length}）
+              </button>
             </div>
-            <div className="favorite-grid">
-              {favorites.map((f) => (
-                <button
-                  className="favorite-card"
-                  key={f.id}
-                  onClick={() => setEditing(f)}
-                >
-                  <span className="star">★</span>
-                  <h3>{f.term}</h3>
-                  <p>{f.meaning || "尚未填寫本文意思"}</p>
-                  <blockquote>{f.sentence}</blockquote>
-                  <div className="tags">
-                    {f.tags.map((t) => (
-                      <span key={t}>{t}</span>
+            {favoriteTab === "articles" ? (
+              <>
+                <input
+                  aria-label="搜尋文章收藏"
+                  className="search"
+                  placeholder="搜尋收藏文章標題、網站或推薦理由…"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                />
+                <ArticleBookmarks
+                  bookmarks={data.articleBookmarks.filter((b) =>
+                    `${b.title} ${b.url} ${b.reasonChinese}`
+                      .toLowerCase()
+                      .includes(search.toLowerCase()),
+                  )}
+                  onOpen={(url) => api.openArticleBookmark(url)}
+                  onRemove={async (url) => {
+                    await api.deleteArticleBookmark(url);
+                    await refresh();
+                  }}
+                  onImport={async (bookmark) => {
+                    const existing = data.articles.find(
+                      (a) => a.source === bookmark.url,
+                    );
+                    const saved =
+                      existing ??
+                      (await api.addArticle({
+                        title: bookmark.title.slice(0, 300),
+                        source: bookmark.url,
+                        body: "",
+                      }));
+                    await refresh();
+                    await openArticle(saved);
+                  }}
+                />
+              </>
+            ) : (
+              <>
+                <div className="search-row">
+                  <input
+                    aria-label="搜尋收藏"
+                    placeholder="搜尋字詞、意思、來源或筆記…"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                  />
+                  <select
+                    aria-label="標籤篩選"
+                    value={tagFilter}
+                    onChange={(e) => setTagFilter(e.target.value)}
+                  >
+                    <option value="">所有標籤</option>
+                    {Array.from(
+                      new Set(data.favorites.flatMap((f) => f.tags)),
+                    ).map((t) => (
+                      <option key={t}>{t}</option>
                     ))}
+                  </select>
+                </div>
+                <div className="favorite-grid">
+                  {favorites.map((f) => (
+                    <button
+                      className="favorite-card"
+                      key={f.id}
+                      onClick={() => setEditing(f)}
+                    >
+                      <span className="star">★</span>
+                      <h3>{f.term}</h3>
+                      <p>{f.meaning || "尚未填寫本文意思"}</p>
+                      <blockquote>{f.sentence}</blockquote>
+                      <div className="tags">
+                        {f.tags.map((t) => (
+                          <span key={t}>{t}</span>
+                        ))}
+                      </div>
+                      <small>{f.title}</small>
+                      {f.note && <p className="note-preview">{f.note}</p>}
+                    </button>
+                  ))}
+                </div>
+                {!favorites.length && (
+                  <div className="empty">
+                    <span className="empty-icon">☆</span>
+                    <h2>
+                      {search || tagFilter
+                        ? "沒有符合的收藏"
+                        : "留住每一次理解"}
+                    </h2>
+                    <p>
+                      閱讀時選取字詞，加上星號與自己的筆記。未設定 AI 也能收藏。
+                    </p>
                   </div>
-                  <small>{f.title}</small>
-                  {f.note && <p className="note-preview">{f.note}</p>}
-                </button>
-              ))}
-            </div>
-            {!favorites.length && (
-              <div className="empty">
-                <span className="empty-icon">☆</span>
-                <h2>
-                  {search || tagFilter ? "沒有符合的收藏" : "留住每一次理解"}
-                </h2>
-                <p>
-                  閱讀時選取字詞，加上星號與自己的筆記。未設定 AI 也能收藏。
-                </p>
-              </div>
+                )}
+              </>
             )}
           </section>
         ) : (
@@ -944,6 +1098,7 @@ function ArticleDialog({
         onSubmit={async (e) => {
           e.preventDefault();
           setBusy(true);
+          setError("");
           try {
             await onSave({
               title: title.trim(),
@@ -962,28 +1117,37 @@ function ArticleDialog({
             <span className="eyebrow">A NEW CHAPTER</span>
             <h2>新增英文文章</h2>
           </div>
-          <button type="button" aria-label="關閉新增文章" onClick={onClose}>
+          <button
+            type="button"
+            aria-label="關閉新增文章"
+            disabled={busy}
+            onClick={onClose}
+          >
             ✕
           </button>
         </div>
         <p className="muted">
-          保留原文程度。儲存後立即開始閱讀，AI 解析由您決定。
+          可貼上英文正文，或只填文章網址自動擷取公開正文。保留原文程度，AI
+          解析由您決定。
         </p>
         <label>
           文章標題
           <input
             autoFocus
-            required
+            required={!source.trim() || !!body.trim()}
+            disabled={busy}
             maxLength={300}
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="為這次閱讀取個名字"
+            placeholder="只填網址時，可自動帶入文章標題"
           />
         </label>
         <label>
-          來源網址 <small>選填</small>
+          來源網址 <small>正文留白時，將從網址擷取文章</small>
           <input
             type="url"
+            aria-label="來源網址"
+            disabled={busy}
             maxLength={2000}
             value={source}
             onChange={(e) => setSource(e.target.value)}
@@ -993,16 +1157,21 @@ function ArticleDialog({
         <label>
           英文原文
           <textarea
-            required
+            required={!source.trim()}
+            disabled={busy}
             maxLength={200000}
             value={body}
             onChange={(e) => setBody(e.target.value)}
-            placeholder="Paste your article here…"
+            placeholder="Paste your article here… 或留白，從上方網址擷取正文"
           />
         </label>
         <small className="muted">
           {body.length.toLocaleString()} / 200,000 字元 · AI 解析上限 60,000
           字元
+        </small>
+        <small className="muted">
+          僅擷取公開 HTML
+          正文；需要登入、付費或無法讀取的網站，請手動貼上。擷取不會呼叫 AI。
         </small>
         {error && (
           <p role="alert" className="error-text">
@@ -1010,14 +1179,23 @@ function ArticleDialog({
           </p>
         )}
         <div className="modal-actions">
-          <button type="button" onClick={onClose}>
-            取消
+          <button
+            type="button"
+            onClick={() => {
+              if (busy)
+                void api
+                  .cancelArticleImport()
+                  .catch((error) => setError(error.message));
+              else onClose();
+            }}
+          >
+            {busy && !body.trim() ? "取消擷取" : "取消"}
           </button>
           <button
             className="primary"
-            disabled={busy || !title.trim() || !body.trim()}
+            disabled={busy || (body.trim() ? !title.trim() : !source.trim())}
           >
-            儲存並開始閱讀 →
+            {busy && !body.trim() ? "正在擷取網頁正文…" : "儲存並開始閱讀 →"}
           </button>
         </div>
       </form>
@@ -1211,6 +1389,13 @@ function Settings({
           <p>本機優先，解析由您掌握。</p>
         </div>
       </div>
+      <RecommendationSettingsEditor
+        settings={data.recommendationSettings}
+        onSave={async (settings) => {
+          await api.recommendationSettings(settings);
+          await onSessionChange();
+        }}
+      />
       <div className="settings-card">
         <h3>ChatGPT 訂閱</h3>
         <p>

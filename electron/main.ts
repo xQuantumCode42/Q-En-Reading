@@ -22,9 +22,20 @@ import { Store } from "./store";
 import { OpenAIProvider, type AIProvider } from "./ai";
 import { ChatGPTAuth } from "./chatgpt-auth";
 import { abortable } from "./abort";
+import { ArticleImporter } from "./article-import";
+import {
+  DailyRecommendations,
+  SearchRecommendationProvider,
+} from "./recommendations";
+import {
+  recommendationSettingsSchema,
+  publicUrl,
+  type ArticleBookmark,
+} from "../shared/recommendations";
 import type { AnalysisPhase } from "../shared/api";
 import {
   articleSchema,
+  articleInputSchema,
   favoriteSchema,
   id,
   kindSchema,
@@ -41,6 +52,9 @@ if (process.env.READING_DESK_TEST_DATA)
 let win: BrowserWindow;
 let store: Store;
 let auth: ChatGPTAuth;
+let recommendations: DailyRecommendations;
+const articleImporter = new ArticleImporter();
+let articleImport: AbortController | undefined;
 const provider: AIProvider = new OpenAIProvider();
 const pending = new Map<string, Promise<Analysis>>();
 const activeRequests = new Map<
@@ -63,6 +77,8 @@ app.on("second-instance", () => {
   }
 });
 function assertAccountIdle() {
+  if (recommendations?.busy)
+    throw new Error("請先等待今日推薦完成或取消搜尋，再變更帳戶。");
   if (pending.size) throw new Error("請等待 AI 解析完成後再變更登入帳戶。");
 }
 async function chooseAccountModel() {
@@ -138,24 +154,92 @@ function registerHandlers() {
   register("snapshot", z.undefined(), async () => ({
     articles: store.list<Article>("article"),
     favorites: store.list<Favorite>("favorite"),
+    articleBookmarks: store.list<ArticleBookmark>("article-bookmark"),
     preferences: store.preferences(),
     chatGPT: await auth.session(),
     dataPath: app.getPath("userData"),
+    recommendationSettings: store.recommendationSettings(),
+    recommendation: recommendations.state(),
   }));
+  register("recommendation:run", z.boolean(), (retry) =>
+    recommendations.ensure(retry),
+  );
+  register("recommendation:refresh", z.undefined(), () =>
+    recommendations.refresh(),
+  );
+  register("recommendation:cancel", z.undefined(), () =>
+    recommendations.cancel(),
+  );
   register(
-    "article:add",
-    articleSchema.pick({ title: true, source: true, body: true }),
-    (input) => {
-      const a: Article = {
-        ...input,
-        id: randomUUID(),
-        position: 0,
-        createdAt: now(),
-        updatedAt: now(),
-      };
-      store.put("article", a);
-      return a;
+    "recommendation:bookmark",
+    z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    (day) => {
+      const record = store.dailyRecommendation(day);
+      if (!record) throw new Error("找不到推薦文章，請重新開啟文章庫。");
+      return store.saveArticleBookmark(record);
     },
+  );
+  register("article-bookmark:delete", z.string().max(2000), (url) =>
+    store.remove("article-bookmark", publicUrl(url)),
+  );
+  register("article-bookmark:open", z.string().max(2000), (url) => {
+    const bookmark = store.get<ArticleBookmark>(
+      "article-bookmark",
+      publicUrl(url),
+    );
+    if (!bookmark) throw new Error("找不到文章收藏。");
+    return shell.openExternal(publicUrl(bookmark.url));
+  });
+  register("recommendation:settings", recommendationSettingsSchema, (input) => {
+    store.setRecommendationSettings(input);
+    if (!input.enabled) recommendations.cancel();
+  });
+  register(
+    "recommendation:open",
+    z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    (day) => {
+      const record = store.dailyRecommendation(day);
+      if (!record) throw new Error("找不到這一天的推薦文章。");
+      return shell.openExternal(publicUrl(record.url));
+    },
+  );
+  register("article:add", articleInputSchema, async (input) => {
+    let content = input;
+    if (!input.body.trim()) {
+      if (articleImport) throw new Error("已有文章正在擷取，請稍候或先取消。");
+      const controller = new AbortController();
+      articleImport = controller;
+      const timeout = setTimeout(
+        () =>
+          controller.abort(
+            new Error("擷取文章逾時（25 秒），請重試或手動貼上正文。"),
+          ),
+        25000,
+      );
+      try {
+        const fetched = await abortable(
+          articleImporter.import(input.source, controller.signal),
+          controller.signal,
+        );
+        controller.signal.throwIfAborted();
+        content = { ...fetched, title: input.title.trim() || fetched.title };
+      } finally {
+        clearTimeout(timeout);
+        if (articleImport === controller) articleImport = undefined;
+      }
+    }
+    const a: Article = articleSchema.parse({
+      ...content,
+      id: randomUUID(),
+      position: 0,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    store.put("article", a);
+    return a;
+  });
+  register("article:cancel-import", z.undefined(), () =>
+    articleImport?.abort(new Error("已取消擷取，網址與其他輸入已保留。")),
   );
   register(
     "article:rename",
@@ -361,6 +445,9 @@ function registerHandlers() {
     return true;
   });
   register("backup:import", z.enum(["merge", "replace"]), async (mode) => {
+    if (articleImport) throw new Error("請先完成或取消文章擷取，再還原備份。");
+    if (recommendations.busy)
+      throw new Error("請先完成或取消今日推薦，再還原備份。");
     if (pending.size) throw new Error("請等待 AI 解析完成後再還原備份。");
     const result = await dialog.showOpenDialog(win, {
       title: "選擇 Reading Desk 備份",
@@ -390,7 +477,7 @@ function registerHandlers() {
         mode === "replace"
           ? "將取代所有文章、解析與收藏。"
           : "合併備份；ID 衝突會建立新副本，不覆寫本機資料。",
-      detail: `備份包含 ${b.articles.length} 篇文章、${b.favorites.length} 筆收藏。還原前將自動保存一份本機安全備份。ChatGPT 登入憑證由此電腦獨立保存。`,
+      detail: `備份包含 ${b.articles.length} 篇文章、${b.favorites.length} 筆字詞收藏、${b.articleBookmarks?.length ?? 0} 筆文章連結收藏。取代還原會以備份內容取代文章連結收藏（舊備份沒有此欄位時清空）。還原前將自動保存一份本機安全備份。ChatGPT 登入憑證由此電腦獨立保存。`,
     });
     if (confirm.response !== 1) return false;
     writeFileSync(
@@ -418,6 +505,28 @@ app.whenReady().then(() => {
       return (await safeStorage.decryptStringAsync(buffer)).result;
     },
   });
+  const searchProvider = new SearchRecommendationProvider();
+  recommendations = new DailyRecommendations(
+    store,
+    async (day, websites, signal, excludedUrls) => {
+      const account = await abortable(auth.session(), signal);
+      if (!account.sharing)
+        throw new Error(
+          "請先在設定登入 ChatGPT 並啟用訂閱使用授權，才能取得今日推薦。",
+        );
+      const model = store.preferences().model;
+      const token = await abortable(auth.accessToken(), signal);
+      signal.throwIfAborted();
+      return searchProvider.search(
+        day,
+        websites,
+        model,
+        token,
+        signal,
+        excludedUrls,
+      );
+    },
+  );
   session.defaultSession.setPermissionRequestHandler(
     (_wc, _permission, callback) => callback(false),
   );
@@ -446,6 +555,10 @@ app.whenReady().then(() => {
 });
 app.on("window-all-closed", () => app.quit());
 app.on("before-quit", () => {
+  articleImport?.abort(new Error("App 已關閉。"));
+  recommendations?.dispose();
+  for (const request of activeRequests.values())
+    request.controller.abort(new Error("App 已關閉。"));
   auth?.cancelSignIn();
   store?.close();
 });
