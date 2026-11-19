@@ -6,7 +6,12 @@ import {
 } from "./recommendations";
 export const text = z.string().max(100000);
 export const id = z.string().uuid();
-export const kindSchema = z.enum(["word", "sentence", "overview"]);
+export const kindSchema = z.enum([
+  "word",
+  "sentence",
+  "overview",
+  "translation",
+]);
 export type Kind = z.infer<typeof kindSchema>;
 export const exampleSchema = z
   .object({
@@ -40,6 +45,16 @@ export type Result = z.infer<typeof resultSchema>;
 export type LearningItem = z.infer<typeof itemSchema>;
 export function validateResult(kind: Kind, value: unknown): Result {
   const result = resultSchema.parse(value);
+  if (
+    kind === "translation" &&
+    (!result.translation.trim() ||
+      result.items.length ||
+      result.summary ||
+      result.structure ||
+      result.idioms ||
+      result.tone)
+  )
+    throw new Error("全文翻譯段落必須包含完整翻譯，不可夾帶其他解析欄位。");
   if (
     kind === "overview" &&
     (result.items.length < 8 || !result.summary.trim())
@@ -79,6 +94,7 @@ export const sourceSchema = z
   );
 export const articleSchema = z
   .object({
+    importedFrom: sourceSchema.optional(),
     id,
     title: z.string().trim().min(1).max(300),
     source: sourceSchema,
@@ -184,6 +200,9 @@ export const backupSchema = z
       if (new Set(b[key].map((x) => x.id)).size !== b[key].length)
         ctx.addIssue({ code: "custom", message: `${key} 有重複 ID` });
     const articles = new Map(b.articles.map((a) => [a.id, a]));
+    for (const bookmark of b.articleBookmarks ?? [])
+      if (bookmark.articleId && !articles.has(bookmark.articleId))
+        ctx.addIssue({ code: "custom", message: "文章收藏的本機文章不存在" });
     const analyses = new Map(b.analyses.map((a) => [a.id, a]));
     for (const a of b.analyses) {
       const article = articles.get(a.articleId);

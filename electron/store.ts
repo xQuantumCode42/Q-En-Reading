@@ -7,6 +7,7 @@ import {
   defaultRecommendationSettings,
   articleBookmarkSchema,
   type ArticleBookmark,
+  publicUrl,
   type DailyRecommendation,
   type RecommendationSettings,
 } from "../shared/recommendations";
@@ -19,6 +20,7 @@ import {
   type Backup,
   type Preferences,
 } from "../shared/schema";
+import { savedTranslations } from "../shared/translation";
 export class Store {
   readonly db: DatabaseSync;
   constructor(file: string) {
@@ -51,6 +53,30 @@ export class Store {
   }
   remove(type: string, id: string) {
     this.db.prepare("DELETE FROM records WHERE type=? AND id=?").run(type, id);
+  }
+  recentReading(now = Date.now()): { id: string; openedAt: string }[] {
+    const all = this.list<{ id: string; openedAt: string }>("recent-reading");
+    const keep = all
+      .filter(
+        (r) =>
+          this.get("article", r.id) &&
+          Number.isFinite(Date.parse(r.openedAt)) &&
+          now - Date.parse(r.openedAt) < 30 * 86400000,
+      )
+      .sort((a, b) => b.openedAt.localeCompare(a.openedAt))
+      .slice(0, 50);
+    const ids = new Set(keep.map((r) => r.id));
+    for (const record of all)
+      if (!ids.has(record.id)) this.remove("recent-reading", record.id);
+    return keep;
+  }
+  touchReading(id: string, now = Date.now()) {
+    if (!this.get("article", id)) throw new Error("文章不存在。");
+    this.put("recent-reading", { id, openedAt: new Date(now).toISOString() });
+    return this.recentReading(now);
+  }
+  clearRecentReading() {
+    this.db.prepare("DELETE FROM records WHERE type='recent-reading'").run();
   }
   preferences(): Preferences {
     const r = this.db
@@ -114,6 +140,74 @@ export class Store {
       this.get("article-bookmark", bookmark.url),
     );
   }
+  linkArticleBookmark(url: string, articleId: string): ArticleBookmark {
+    url = publicUrl(url);
+    const bookmark = this.get<ArticleBookmark>("article-bookmark", url);
+    if (!bookmark || !this.get("article", articleId))
+      throw new Error("找不到收藏或已保存文章。");
+    const linked = articleBookmarkSchema.parse({ ...bookmark, articleId });
+    this.db
+      .prepare(
+        "UPDATE records SET data=? WHERE type='article-bookmark' AND id=?",
+      )
+      .run(JSON.stringify(linked), url);
+    return linked;
+  }
+  articleBookmarks(): ArticleBookmark[] {
+    const articles = this.list<Article>("article");
+    const analyses = this.list<Analysis>("analysis");
+    const normalized = (value: string) => {
+      try {
+        return publicUrl(value);
+      } catch {
+        return "";
+      }
+    };
+    return this.list<ArticleBookmark>("article-bookmark").map((bookmark) => {
+      if (
+        bookmark.articleId &&
+        articles.some((a) => a.id === bookmark.articleId)
+      )
+        return bookmark;
+      const matches = articles.filter((a) =>
+        [a.source, a.importedFrom ?? ""].some(
+          (url) => normalized(url) === bookmark.url,
+        ),
+      );
+      matches.sort(
+        (a, b) =>
+          analyses.filter(
+            (x) => x.articleId === b.id && x.kind === "translation",
+          ).length -
+          analyses.filter(
+            (x) => x.articleId === a.id && x.kind === "translation",
+          ).length,
+      );
+      return matches[0]
+        ? this.linkArticleBookmark(bookmark.url, matches[0].id)
+        : bookmark;
+    });
+  }
+  translationProgress(): Record<string, { completed: number; total: number }> {
+    const history = this.list<Analysis>("analysis");
+    const model = this.preferences().model;
+    return Object.fromEntries(
+      this.list<Article>("article").map((article) => {
+        const state = savedTranslations(
+          article.body,
+          history.filter((a) => a.articleId === article.id),
+          model,
+        );
+        return [
+          article.id,
+          {
+            completed: state.saved.filter(Boolean).length,
+            total: state.chunks.length,
+          },
+        ];
+      }),
+    );
+  }
   transaction(fn: () => void) {
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -126,7 +220,19 @@ export class Store {
   }
   deleteArticle(id: string) {
     this.transaction(() => {
+      for (const bookmark of this.list<ArticleBookmark>("article-bookmark"))
+        if (bookmark.articleId === id) {
+          this.db
+            .prepare(
+              "UPDATE records SET data=? WHERE type='article-bookmark' AND id=?",
+            )
+            .run(
+              JSON.stringify({ ...bookmark, articleId: null }),
+              bookmark.url,
+            );
+        }
       this.remove("article", id);
+      this.remove("recent-reading", id);
       const ids = this.list<Analysis>("analysis")
         .filter((a) => a.articleId === id)
         .map((a) => a.id);
@@ -147,7 +253,7 @@ export class Store {
       preferences: this.preferences(),
       recommendationSettings: this.recommendationSettings(),
       recommendations: this.list<DailyRecommendation>("recommendation"),
-      articleBookmarks: this.list<ArticleBookmark>("article-bookmark"),
+      articleBookmarks: this.articleBookmarks(),
     });
   }
   restore(value: unknown, mode: "merge" | "replace", today = localDay()) {
@@ -162,13 +268,6 @@ export class Store {
         this.setPreferences(b.preferences);
       }
       if (lockedToday) this.saveRecommendation(lockedToday);
-      for (const bookmark of b.articleBookmarks ?? []) {
-        this.db
-          .prepare(
-            "INSERT OR IGNORE INTO records(type,id,data) VALUES('article-bookmark',?,?)",
-          )
-          .run(bookmark.url, JSON.stringify(bookmark));
-      }
       for (const recommendation of b.recommendations ?? [])
         this.saveRecommendation(recommendation);
       if (
@@ -191,6 +290,37 @@ export class Store {
       );
       for (const a of b.articles)
         this.put("article", { ...a, id: articleIds.get(a.id)! });
+      for (const bookmark of b.articleBookmarks ?? []) {
+        const linked = {
+          ...bookmark,
+          ...(bookmark.articleId
+            ? { articleId: articleIds.get(bookmark.articleId) }
+            : {}),
+        };
+        const local = this.get<ArticleBookmark>(
+          "article-bookmark",
+          bookmark.url,
+        );
+        if (
+          local &&
+          linked.articleId &&
+          (!local.articleId || !this.get("article", local.articleId))
+        ) {
+          this.db
+            .prepare(
+              "UPDATE records SET data=? WHERE type='article-bookmark' AND id=?",
+            )
+            .run(
+              JSON.stringify({ ...local, articleId: linked.articleId }),
+              bookmark.url,
+            );
+        }
+        this.db
+          .prepare(
+            "INSERT OR IGNORE INTO records(type,id,data) VALUES('article-bookmark',?,?)",
+          )
+          .run(bookmark.url, JSON.stringify(linked));
+      }
       for (const a of b.analyses)
         this.put("analysis", {
           ...a,

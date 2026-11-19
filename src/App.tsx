@@ -9,6 +9,8 @@ import type {
 } from "../shared/schema";
 import { defaultPreferences } from "../shared/schema";
 import { ArticleBookmarks } from "./ArticleBookmarks";
+import { TranslationView } from "./TranslationView";
+import { translationChunks } from "../shared/translation";
 import type { Snapshot, ChatGPTModel, AnalysisProgress } from "../shared/api";
 import { localDay, type RecommendationState } from "../shared/recommendations";
 import {
@@ -21,6 +23,7 @@ const labels: Record<Kind, string> = {
   word: "字詞解析",
   sentence: "句子解析",
   overview: "全文重點",
+  translation: "全文中文翻譯",
 };
 type Selection = { text: string; start: number; end: number; sentence: string };
 const emptySelection: Selection = { text: "", start: 0, end: 0, sentence: "" };
@@ -34,8 +37,27 @@ export default function App() {
     "library",
   );
   const [activeId, setActiveId] = useState("");
+  const [showLibrary, setShowLibrary] = useState(false);
+  const [recentCollapsed, setRecentCollapsed] = useState(
+    () => localStorage.getItem("reading-recent-collapsed") === "true",
+  );
+  const [readerMode, setReaderMode] = useState<
+    "original" | "assistant" | "translation"
+  >("original");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem("reading-sidebar-collapsed") === "true",
+  );
+  const [translationError, setTranslationError] = useState("");
+  const [translatedCount, setTranslatedCount] = useState(0);
+  const translationCancelled = useRef(false);
+  useEffect(() => {
+    localStorage.setItem("reading-sidebar-collapsed", String(sidebarCollapsed));
+    localStorage.setItem("reading-recent-collapsed", String(recentCollapsed));
+  }, [sidebarCollapsed, recentCollapsed]);
   const [adding, setAdding] = useState(false);
   const [selection, setSelection] = useState<Selection>(emptySelection);
+  const selectionRef = useRef(selection);
+  selectionRef.current = selection;
   const [analysis, setAnalysis] = useState<Analysis>();
   const [history, setHistory] = useState<Analysis[]>([]);
   const [busy, setBusy] = useState(false);
@@ -190,23 +212,41 @@ export default function App() {
     });
   }, [activeId]);
   useEffect(() => {
-    if (page !== "library" || !article || !reader.current) return;
+    if (
+      page !== "library" ||
+      showLibrary ||
+      readerMode === "translation" ||
+      !article ||
+      !reader.current
+    )
+      return;
     const el = reader.current;
     requestAnimationFrame(() => {
       el.scrollTop =
         article.position * Math.max(0, el.scrollHeight - el.clientHeight);
     });
-  }, [activeId, page]);
+  }, [activeId, page, showLibrary, readerMode]);
   function openArticle(a: Article) {
     flushPosition();
+    if (analysisArticle.current && analysisArticle.current !== a.id)
+      cancelCurrentAnalysis();
     setActiveId(a.id);
+    setShowLibrary(false);
+    setReaderMode("original");
+    setTranslationError("");
     setPage("library");
     setAdding(false);
     setError("");
+    void api
+      .touchReading(a.id)
+      .then((recentReading) =>
+        setData((d) => (d ? { ...d, recentReading } : d)),
+      )
+      .catch((e) => setError(e.message));
   }
   function onScroll() {
     const el = reader.current;
-    if (!el || !article) return;
+    if (!el || !article || showLibrary || readerMode === "translation") return;
     const position =
       el.scrollHeight <= el.clientHeight
         ? 0
@@ -250,7 +290,9 @@ export default function App() {
         right < 0 ? article.body.length : end + right + 1,
       )
       .trim();
-    setSelection({ text, start, end, sentence });
+    const nextSelection = { text, start, end, sentence };
+    selectionRef.current = nextSelection;
+    setSelection(nextSelection);
     setAnalysis(undefined);
     setDraftNote("");
     setDraftTags("");
@@ -258,6 +300,7 @@ export default function App() {
   }
   async function analyze(kind: Kind) {
     if (!article || analysisArticle.current) return;
+    setReaderMode("assistant");
     const articleId = article.id;
     analysisArticle.current = articleId;
     setElapsed(0);
@@ -273,7 +316,12 @@ export default function App() {
         end: selection.end,
       });
       if (currentId.current === articleId) {
-        setAnalysis(a);
+        if (
+          kind === "overview" ||
+          (selectionRef.current.start === a.start &&
+            selectionRef.current.end === a.end)
+        )
+          setAnalysis(a);
         setHistory((h) => [a, ...h.filter((x) => x.id !== a.id)]);
       }
     } catch (e) {
@@ -281,6 +329,55 @@ export default function App() {
     } finally {
       analysisArticle.current = undefined;
       setBusy(false);
+    }
+  }
+  function cancelCurrentAnalysis() {
+    translationCancelled.current = true;
+    if (analysisArticle.current)
+      void api
+        .cancelAnalysis(analysisArticle.current)
+        .catch((e) => setError(e.message));
+  }
+  async function translateArticle() {
+    if (!article || analysisArticle.current) return;
+    const id = article.id;
+    analysisArticle.current = id;
+    translationCancelled.current = false;
+    setBusy(true);
+    setElapsed(0);
+    setTranslationError("");
+    setLastKind("translation");
+    try {
+      const chunks = translationChunks(article.body).filter((c) =>
+        article.body.slice(c.start, c.end).trim(),
+      );
+      for (let index = 0; index < chunks.length; index++) {
+        if (translationCancelled.current || currentId.current !== id) break;
+        setTranslatedCount(index);
+        const chunk = chunks[index];
+        const result = await api.analyze({
+          articleId: id,
+          kind: "translation",
+          start: chunk.start,
+          end: chunk.end,
+        });
+        if (currentId.current === id)
+          setHistory((h) => [result, ...h.filter((a) => a.id !== result.id)]);
+        if (result.model !== prefs.model)
+          throw new Error(
+            "解析模型已變更，完成段落已保存；請使用目前模型接續翻譯。",
+          );
+      }
+      if (translationCancelled.current && currentId.current === id)
+        setTranslationError("已取消翻譯，完成的段落已保存，可稍後接續。");
+    } catch (e) {
+      if (currentId.current === id) setTranslationError((e as Error).message);
+    } finally {
+      analysisArticle.current = undefined;
+      setBusy(false);
+      void refresh().catch((e) =>
+        setError(`翻譯已逐段保存，但收藏狀態更新失敗：${(e as Error).message}`),
+      );
     }
   }
   async function star(item?: LearningItem) {
@@ -342,13 +439,21 @@ export default function App() {
         (!tagFilter || f.tags.includes(tagFilter)),
     ) ?? [];
   return (
-    <div className="app">
+    <div className={`app ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar">
+        <button
+          className="sidebar-toggle"
+          aria-label={sidebarCollapsed ? "展開側邊選單" : "收起側邊選單"}
+          aria-expanded={!sidebarCollapsed}
+          onClick={() => setSidebarCollapsed((v) => !v)}
+        >
+          {sidebarCollapsed ? "☰" : "‹ 收起選單"}
+        </button>
         <div className="brand">
           <span className="brand-icon">
             R<span>·</span>
           </span>
-          <div>
+          <div className="brand-name">
             Reading Desk<small>每天，讀懂多一點。</small>
           </div>
         </div>
@@ -358,15 +463,20 @@ export default function App() {
             <button
               className={page === p ? "nav active" : "nav"}
               key={p}
+              aria-label={["文章庫", "星號收藏", "設定"][i]}
+              title={["文章庫", "星號收藏", "設定"][i]}
               onClick={() => {
                 flushPosition();
                 setPage(p);
+                setShowLibrary(false);
                 setSearch("");
                 setError("");
               }}
             >
               <span>{["▤", "☆", "⚙"][i]}</span>
-              {["文章庫", "星號收藏", "設定"][i]}
+              <span className="nav-text">
+                {["文章庫", "星號收藏", "設定"][i]}
+              </span>
               {p !== "settings" && (
                 <b>
                   {p === "library"
@@ -378,6 +488,55 @@ export default function App() {
             </button>
           ))}
         </nav>
+        {!sidebarCollapsed && data && (
+          <details
+            className="recent-reading"
+            aria-label="最近閱讀"
+            open={!recentCollapsed}
+            onToggle={(event) => setRecentCollapsed(!event.currentTarget.open)}
+          >
+            <summary aria-label="摺疊或展開最近閱讀">
+              最近閱讀 <span>{data.recentReading.length} 篇</span>
+            </summary>
+            <div className="recent-heading">
+              <span className="muted small">最近 30 天</span>
+              <button
+                disabled={!data.recentReading.length}
+                onClick={() =>
+                  void action(async () => {
+                    await api.clearRecentReading();
+                    await refresh();
+                  })
+                }
+              >
+                清空
+              </button>
+            </div>
+            <p className="muted small">最多 50 篇；清理不刪文章。</p>
+            {data.recentReading.map((r) => {
+              const a = data.articles.find((a) => a.id === r.id);
+              return (
+                a && (
+                  <button
+                    key={r.id}
+                    className={`recent-open ${a.id === activeId && !showLibrary ? "active" : ""}`}
+                    aria-label={`繼續閱讀：${a.title}`}
+                    onClick={() => openArticle(a)}
+                  >
+                    <span>
+                      {a.id === activeId && !showLibrary ? "● " : ""}
+                      {a.title}
+                    </span>
+                    <small>{Math.round(a.position * 100)}% 已讀</small>
+                  </button>
+                )
+              );
+            })}
+            {!data.recentReading.length && (
+              <p className="muted small">開啟文章後會出現在這裡。</p>
+            )}
+          </details>
+        )}
         <div className="sidebar-bottom">
           <div className="local-dot" /> 儲存在這台電腦
           <small>原文閱讀 · 語境學習</small>
@@ -396,6 +555,18 @@ export default function App() {
             </h1>
           </div>
           <div className="top-actions">
+            {page === "library" && (
+              <button
+                onClick={() => {
+                  flushPosition();
+                  setSearch("");
+                  setShowLibrary(true);
+                }}
+              >
+                管理文章
+              </button>
+            )}
+            {busy && <button onClick={cancelCurrentAnalysis}>停止 AI</button>}
             <button
               title="切換明暗模式"
               onClick={() =>
@@ -429,7 +600,7 @@ export default function App() {
             state={daily}
             connected={data.chatGPT.sharing}
             enabled={data.recommendationSettings.enabled}
-            compact={!!article}
+            compact={!!article && !showLibrary}
             onRetry={() => void loadDaily(true)}
             onRefresh={() => void loadDaily(true, true)}
             onCancel={() => void action(() => api.cancelRecommendation())}
@@ -524,6 +695,19 @@ export default function App() {
                   onChange={(e) => setSearch(e.target.value)}
                 />
                 <ArticleBookmarks
+                  articles={data.articles}
+                  progress={data.translationProgress}
+                  onLink={async (url, articleId) => {
+                    await api.linkArticleBookmark({ url, articleId });
+                    await refresh();
+                    const linked = data.articles.find(
+                      (a) => a.id === articleId,
+                    );
+                    if (linked) {
+                      openArticle(linked);
+                      setReaderMode("translation");
+                    }
+                  }}
                   bookmarks={data.articleBookmarks.filter((b) =>
                     `${b.title} ${b.url} ${b.reasonChinese}`
                       .toLowerCase()
@@ -536,7 +720,7 @@ export default function App() {
                   }}
                   onImport={async (bookmark) => {
                     const existing = data.articles.find(
-                      (a) => a.source === bookmark.url,
+                      (a) => a.id === bookmark.articleId,
                     );
                     const saved =
                       existing ??
@@ -545,8 +729,14 @@ export default function App() {
                         source: bookmark.url,
                         body: "",
                       }));
+                    await api.linkArticleBookmark({
+                      url: bookmark.url,
+                      articleId: saved.id,
+                    });
                     await refresh();
                     await openArticle(saved);
+                    if (data.translationProgress[saved.id]?.completed)
+                      setReaderMode("translation");
                   }}
                 />
               </>
@@ -611,350 +801,461 @@ export default function App() {
           </section>
         ) : (
           <div className="reading-layout">
-            <section className="article-list">
-              <div className="list-heading">
-                閱讀清單 <span>{data.articles.length}</span>
-              </div>
-              <input
-                aria-label="搜尋文章"
-                className="search"
-                placeholder="搜尋文章…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-              />
-              <div className="article-items">
-                {filtered.map((a) => (
-                  <div
-                    className={
-                      "article-entry " + (a.id === activeId ? "selected" : "")
-                    }
-                    key={a.id}
-                  >
+            {showLibrary && (
+              <div className="modal-backdrop">
+                <section
+                  className="article-list library-manager article-management-modal"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-label="管理文章"
+                >
+                  <div className="list-heading">
+                    <h2>
+                      管理文章 <small>{data.articles.length} 篇</small>
+                    </h2>
                     <button
-                      className="article-open"
-                      onClick={() => openArticle(a)}
+                      aria-label="關閉文章管理"
+                      onClick={() => setShowLibrary(false)}
                     >
-                      <small>
-                        {new Date(a.createdAt).toLocaleDateString("zh-TW")} ·{" "}
-                        {Math.max(
-                          1,
-                          Math.ceil(a.body.split(/\s+/).length / 220),
-                        )}{" "}
-                        分鐘
-                      </small>
-                      <strong>{a.title}</strong>
-                      <p>{a.body.slice(0, 90)}</p>
-                      <div className="progress">
-                        <i style={{ width: `${a.position * 100}%` }} />
-                      </div>
+                      關閉
                     </button>
-                    <div className="entry-actions">
-                      <button
-                        aria-label={`重新命名 ${a.title}`}
-                        onClick={() => setRename(a)}
-                      >
-                        重新命名
-                      </button>
-                      <button
-                        aria-label={`刪除 ${a.title}`}
-                        onClick={() => setDeleteId(a.id)}
-                      >
-                        刪除
-                      </button>
-                    </div>
                   </div>
-                ))}
+                  <input
+                    aria-label="搜尋文章"
+                    className="search"
+                    placeholder="搜尋文章…"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                  />
+                  <div className="article-items">
+                    {filtered.map((a) => (
+                      <div
+                        className={
+                          "article-entry " +
+                          (a.id === activeId ? "selected" : "")
+                        }
+                        key={a.id}
+                      >
+                        <button
+                          className="article-open"
+                          onClick={() => openArticle(a)}
+                        >
+                          <small>
+                            {new Date(a.createdAt).toLocaleDateString("zh-TW")}{" "}
+                            ·{" "}
+                            {Math.max(
+                              1,
+                              Math.ceil(a.body.split(/\s+/).length / 220),
+                            )}{" "}
+                            分鐘
+                          </small>
+                          <strong>{a.title}</strong>
+                          <p>{a.body.slice(0, 90)}</p>
+                          <div className="progress">
+                            <i style={{ width: `${a.position * 100}%` }} />
+                          </div>
+                        </button>
+                        <div className="entry-actions">
+                          <button
+                            aria-label={`重新命名 ${a.title}`}
+                            onClick={() => setRename(a)}
+                          >
+                            重新命名
+                          </button>
+                          <button
+                            aria-label={`刪除 ${a.title}`}
+                            onClick={() => setDeleteId(a.id)}
+                          >
+                            刪除
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {!filtered.length && (
+                    <p className="list-empty">
+                      {search
+                        ? "沒有符合的文章"
+                        : "您的第一篇文章，從這裡開始。"}
+                    </p>
+                  )}
+                </section>
               </div>
-              {!filtered.length && (
-                <p className="list-empty">
-                  {search ? "沒有符合的文章" : "您的第一篇文章，從這裡開始。"}
-                </p>
-              )}
-            </section>
+            )}
             {article ? (
               <>
-                <section className="reader" ref={reader} onScroll={onScroll}>
-                  <div className="reader-tools">
-                    <span>原文閱讀</span>
-                    <div>
+                <div
+                  className="reader-tabs"
+                  role="tablist"
+                  aria-label="閱讀模式"
+                >
+                  {(["original", "translation", "assistant"] as const).map(
+                    (mode, i) => (
                       <button
-                        aria-label="縮小字體"
-                        onClick={() =>
-                          void preferences({
-                            ...prefs,
-                            fontSize: Math.max(16, prefs.fontSize - 1),
-                          })
+                        key={mode}
+                        role="tab"
+                        aria-selected={readerMode === mode}
+                        aria-controls={
+                          mode === "translation"
+                            ? "reading-translation"
+                            : "reading-text-content"
                         }
+                        id={`tab-${mode}`}
+                        onClick={() => {
+                          flushPosition();
+                          setReaderMode(mode);
+                        }}
                       >
-                        A−
+                        {["原文閱讀", "全文中文對照", "文章解析"][i]}
                       </button>
-                      <span>{prefs.fontSize}</span>
-                      <button
-                        aria-label="放大字體"
-                        onClick={() =>
-                          void preferences({
-                            ...prefs,
-                            fontSize: Math.min(32, prefs.fontSize + 1),
-                          })
-                        }
-                      >
-                        A＋
-                      </button>
-                      <select
-                        aria-label="行距"
-                        value={prefs.lineHeight}
-                        onChange={(e) =>
-                          void preferences({
-                            ...prefs,
-                            lineHeight: Number(e.target.value),
-                          })
-                        }
-                      >
-                        {[1.4, 1.7, 1.9, 2.2, 2.6].map((n) => (
-                          <option key={n} value={n}>
-                            行距 {n}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  <article className="reading-paper">
-                    <div className="eyebrow">READ AT YOUR OWN PACE</div>
-                    <h2>{article.title}</h2>
-                    <div className="article-meta">
-                      {article.body.split(/\s+/).length.toLocaleString()} 字 ·{" "}
-                      {new Date(article.createdAt).toLocaleDateString("zh-TW")}
-                      {article.source && (
-                        <span title={article.source}>
-                          來源：{new URL(article.source).hostname}
-                        </span>
-                      )}
-                    </div>
-                    <div
-                      className="original-text"
-                      ref={body}
-                      onMouseUp={capture}
-                      onKeyUp={capture}
-                      style={{
-                        fontSize: prefs.fontSize,
-                        lineHeight: prefs.lineHeight,
-                      }}
-                    >
-                      {article.body}
-                    </div>
-                    <div className="end-mark">◇</div>
-                  </article>
-                </section>
-                <aside className="inspector">
-                  <div className="inspector-heading">
-                    <span>✧ 閱讀助手</span>
-                    <small>ENGLISH ＋ 繁中輔助</small>
-                  </div>
-                  <div className="inspector-content">
-                    <button
-                      className="overview-button"
-                      disabled={busy}
-                      onClick={() => void analyze("overview")}
-                    >
-                      ✧ 整理全文學習重點
-                    </button>
-                    <p className="muted small">
-                      僅在點擊時呼叫 AI；已完成的解析會保存在本機。
-                    </p>
-                    {selection.text && (
-                      <div className="selection-box">
-                        <small>目前選取</small>
-                        <blockquote>{selection.text}</blockquote>
-                        <div className="button-row">
-                          <button
-                            disabled={busy}
-                            onClick={() => void analyze("word")}
-                          >
-                            字詞解析
-                          </button>
-                          <button
-                            disabled={busy}
-                            onClick={() => void analyze("sentence")}
-                          >
-                            句子解析
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                    {busy && (
-                      <div className="loading" role="status">
-                        {
-                          {
-                            authorizing: "正在確認訂閱授權",
-                            connecting: "正在連線 AI 服務",
-                            reasoning: "模型正在整理語境",
-                            generating: "正在產生解析",
-                            validating: "正在驗證解析資料",
-                          }[progress?.phase ?? "connecting"]
-                        }{" "}
-                        · {elapsed} 秒
-                        {!!progress?.characters && (
-                          <p>
-                            已收到 {progress.characters.toLocaleString()} 個字元
-                          </p>
-                        )}
+                    ),
+                  )}
+                </div>
+                <div
+                  className={`reading-panels ${readerMode === "assistant" ? "analysis-split" : ""}`}
+                  hidden={readerMode === "translation"}
+                  id="reading-text-content"
+                  role="tabpanel"
+                  aria-labelledby={`tab-${readerMode}`}
+                >
+                  <section
+                    className="reader"
+                    aria-label="文章原文"
+                    ref={reader}
+                    onScroll={onScroll}
+                  >
+                    <div className="reader-tools">
+                      <span>原文閱讀</span>
+                      <div>
                         <button
-                          onClick={() => {
-                            const articleId = analysisArticle.current;
-                            if (articleId)
-                              void api
-                                .cancelAnalysis(articleId)
-                                .catch((error) => setError(error.message));
-                          }}
+                          aria-label="縮小字體"
+                          onClick={() =>
+                            void preferences({
+                              ...prefs,
+                              fontSize: Math.max(16, prefs.fontSize - 1),
+                            })
+                          }
                         >
-                          取消解析
+                          A−
+                        </button>
+                        <span>{prefs.fontSize}</span>
+                        <button
+                          aria-label="放大字體"
+                          onClick={() =>
+                            void preferences({
+                              ...prefs,
+                              fontSize: Math.min(32, prefs.fontSize + 1),
+                            })
+                          }
+                        >
+                          A＋
+                        </button>
+                        <select
+                          aria-label="行距"
+                          value={prefs.lineHeight}
+                          onChange={(e) =>
+                            void preferences({
+                              ...prefs,
+                              lineHeight: Number(e.target.value),
+                            })
+                          }
+                        >
+                          {[1.4, 1.7, 1.9, 2.2, 2.6].map((n) => (
+                            <option key={n} value={n}>
+                              行距 {n}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    {selection.text && readerMode === "original" && (
+                      <div className="selection-toolbar">
+                        <span>已選取：{selection.text.slice(0, 80)}</span>
+                        <button
+                          disabled={busy}
+                          onClick={() => void analyze("word")}
+                        >
+                          字詞解析
+                        </button>
+                        <button
+                          disabled={busy}
+                          onClick={() => void analyze("sentence")}
+                        >
+                          句子解析
+                        </button>
+                        <button onClick={() => setReaderMode("assistant")}>
+                          筆記與收藏
                         </button>
                       </div>
                     )}
-                    {!busy && error && (
-                      <button onClick={() => void analyze(lastKind)}>
-                        重試{labels[lastKind]}
-                      </button>
-                    )}
-                    {analysis ? (
-                      <div className="analysis-result">
-                        <div className="result-heading">
-                          <span>{labels[analysis.kind]}</span>
-                          <small>已保存 · {analysis.model}</small>
-                        </div>
-                        {analysis.result.summary && (
-                          <AnalysisText
-                            title="摘要 SUMMARY"
-                            text={analysis.result.summary}
-                          />
+                    <article className="reading-paper">
+                      <div className="eyebrow">READ AT YOUR OWN PACE</div>
+                      <h2>{article.title}</h2>
+                      <div className="article-meta">
+                        {article.body.split(/\s+/).length.toLocaleString()} 字 ·{" "}
+                        {new Date(article.createdAt).toLocaleDateString(
+                          "zh-TW",
                         )}
-                        {analysis.result.translation && (
-                          <AnalysisText
-                            title="句意翻譯"
-                            text={analysis.result.translation}
-                          />
+                        {article.source && (
+                          <span title={article.source}>
+                            來源：{new URL(article.source).hostname}
+                          </span>
                         )}
-                        {analysis.result.structure && (
-                          <AnalysisText
-                            title="句子結構 STRUCTURE"
-                            text={analysis.result.structure}
-                          />
-                        )}
-                        {analysis.result.idioms && (
-                          <AnalysisText
-                            title="慣用語 IDIOMS"
-                            text={analysis.result.idioms}
-                          />
-                        )}
-                        {analysis.result.tone && (
-                          <AnalysisText
-                            title="語氣 TONE"
-                            text={analysis.result.tone}
-                          />
-                        )}
-                        {analysis.result.items.map((item, i) => (
-                          <div className="learning-item" key={i}>
-                            <div className="term-line">
-                              <h3>{item.term}</h3>
-                              <button
-                                title="收藏此項目"
-                                onClick={() => void star(item)}
-                              >
-                                ☆ 收藏
-                              </button>
-                            </div>
-                            <span className="part-of-speech">
-                              {item.partOfSpeech}
-                            </span>
-                            <p>{item.meaning}</p>
-                            <p className="english">{item.explanation}</p>
-                            {!!item.collocations.length && (
-                              <p className="collocations">
-                                常見搭配：{item.collocations.join(" · ")}
-                              </p>
-                            )}
-                            {item.examples.map((e, j) => (
-                              <div className="example" key={j}>
-                                <small>
-                                  {e.context === "daily"
-                                    ? "日常情境"
-                                    : "接近原文的情境"}
-                                </small>
-                                <p>{e.english}</p>
-                                <p className="muted">{e.chinese}</p>
-                              </div>
-                            ))}
-                          </div>
-                        ))}
                       </div>
-                    ) : (
-                      !selection.text && (
-                        <div className="assistant-empty">
-                          <span>“ ”</span>
-                          <h3>理解，從一個詞開始。</h3>
-                          <p>
-                            選取原文中的字詞或句子，再點擊解析，探索它在文章中的意思。
-                          </p>
-                          {!data.chatGPT.sharing && (
-                            <button onClick={() => setPage("settings")}>
-                              使用 ChatGPT 訂閱 →
+                      <div
+                        className="original-text"
+                        ref={body}
+                        onMouseUp={capture}
+                        onKeyUp={capture}
+                        style={{
+                          fontSize: prefs.fontSize,
+                          lineHeight: prefs.lineHeight,
+                        }}
+                      >
+                        {article.body}
+                      </div>
+                      <div className="end-mark">◇</div>
+                    </article>
+                  </section>
+                  <aside
+                    className="inspector"
+                    aria-label="文章解析"
+                    hidden={readerMode !== "assistant"}
+                  >
+                    <div className="inspector-heading">
+                      <span>✧ 文章解析</span>
+                      <small>ENGLISH ＋ 繁中輔助</small>
+                    </div>
+                    <div className="inspector-content">
+                      <button
+                        className="overview-button"
+                        disabled={busy}
+                        onClick={() => void analyze("overview")}
+                      >
+                        ✧ 整理全文學習重點
+                      </button>
+                      <p className="muted small">
+                        僅在點擊時呼叫 AI；已完成的解析會保存在本機。
+                      </p>
+                      {selection.text && (
+                        <div className="selection-box">
+                          <small>目前選取</small>
+                          <blockquote>{selection.text}</blockquote>
+                          <div className="button-row">
+                            <button
+                              disabled={busy}
+                              onClick={() => void analyze("word")}
+                            >
+                              字詞解析
                             </button>
-                          )}
+                            <button
+                              disabled={busy}
+                              onClick={() => void analyze("sentence")}
+                            >
+                              句子解析
+                            </button>
+                          </div>
                         </div>
-                      )
-                    )}
-                    {(selection.text ||
-                      (analysis && analysis.kind !== "overview")) && (
-                      <div className="personal-note">
-                        <label>
-                          我的筆記
-                          <textarea
-                            placeholder="記下你對這個語境的理解…"
-                            value={draftNote}
-                            onChange={(e) => setDraftNote(e.target.value)}
-                            maxLength={100000}
-                          />
-                        </label>
-                        <input
-                          placeholder="標籤，以逗號分隔"
-                          aria-label="收藏標籤"
-                          value={draftTags}
-                          onChange={(e) => setDraftTags(e.target.value)}
-                        />
-                        <button
-                          className="primary full"
-                          onClick={() => void star(analysis?.result.items[0])}
-                        >
-                          ☆ 收藏並保存筆記
-                        </button>
-                      </div>
-                    )}
-                    {!!history.length && (
-                      <div className="history">
-                        <h4>這篇文章的解析紀錄</h4>
-                        {history.map((a) => (
+                      )}
+                      {busy && (
+                        <div className="loading" role="status">
+                          {
+                            {
+                              authorizing: "正在確認訂閱授權",
+                              connecting: "正在連線 AI 服務",
+                              reasoning: "模型正在整理語境",
+                              generating: "正在產生解析",
+                              validating: "正在驗證解析資料",
+                            }[progress?.phase ?? "connecting"]
+                          }{" "}
+                          · {elapsed} 秒
+                          {!!progress?.characters && (
+                            <p>
+                              已收到 {progress.characters.toLocaleString()}{" "}
+                              個字元
+                            </p>
+                          )}
                           <button
-                            key={a.id}
                             onClick={() => {
-                              setAnalysis(a);
-                              setSelection({
-                                text: a.selection,
-                                start: a.start,
-                                end: a.end,
-                                sentence: a.selection,
-                              });
-                              setDraftNote("");
-                              setDraftTags("");
+                              const articleId = analysisArticle.current;
+                              if (articleId)
+                                void api
+                                  .cancelAnalysis(articleId)
+                                  .catch((error) => setError(error.message));
                             }}
                           >
-                            <span>{labels[a.kind]}</span>
-                            {a.selection || "全文摘要與學習項目"}
+                            取消解析
                           </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </aside>
+                        </div>
+                      )}
+                      {!busy && error && lastKind !== "translation" && (
+                        <button onClick={() => void analyze(lastKind)}>
+                          重試{labels[lastKind]}
+                        </button>
+                      )}
+                      {analysis ? (
+                        <div className="analysis-result">
+                          <div className="result-heading">
+                            <span>{labels[analysis.kind]}</span>
+                            <small>已保存 · {analysis.model}</small>
+                          </div>
+                          {analysis.result.summary && (
+                            <AnalysisText
+                              title="摘要 SUMMARY"
+                              text={analysis.result.summary}
+                            />
+                          )}
+                          {analysis.result.translation && (
+                            <AnalysisText
+                              title="句意翻譯"
+                              text={analysis.result.translation}
+                            />
+                          )}
+                          {analysis.result.structure && (
+                            <AnalysisText
+                              title="句子結構 STRUCTURE"
+                              text={analysis.result.structure}
+                            />
+                          )}
+                          {analysis.result.idioms && (
+                            <AnalysisText
+                              title="慣用語 IDIOMS"
+                              text={analysis.result.idioms}
+                            />
+                          )}
+                          {analysis.result.tone && (
+                            <AnalysisText
+                              title="語氣 TONE"
+                              text={analysis.result.tone}
+                            />
+                          )}
+                          {analysis.result.items.map((item, i) => (
+                            <div className="learning-item" key={i}>
+                              <div className="term-line">
+                                <h3>{item.term}</h3>
+                                <button
+                                  title="收藏此項目"
+                                  onClick={() => void star(item)}
+                                >
+                                  ☆ 收藏
+                                </button>
+                              </div>
+                              <span className="part-of-speech">
+                                {item.partOfSpeech}
+                              </span>
+                              <p>{item.meaning}</p>
+                              <p className="english">{item.explanation}</p>
+                              {!!item.collocations.length && (
+                                <p className="collocations">
+                                  常見搭配：{item.collocations.join(" · ")}
+                                </p>
+                              )}
+                              {item.examples.map((e, j) => (
+                                <div className="example" key={j}>
+                                  <small>
+                                    {e.context === "daily"
+                                      ? "日常情境"
+                                      : "接近原文的情境"}
+                                  </small>
+                                  <p>{e.english}</p>
+                                  <p className="muted">{e.chinese}</p>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        !selection.text && (
+                          <div className="assistant-empty">
+                            <span>“ ”</span>
+                            <h3>理解，從一個詞開始。</h3>
+                            <p>
+                              選取原文中的字詞或句子，再點擊解析，探索它在文章中的意思。
+                            </p>
+                            {!data.chatGPT.sharing && (
+                              <button onClick={() => setPage("settings")}>
+                                使用 ChatGPT 訂閱 →
+                              </button>
+                            )}
+                          </div>
+                        )
+                      )}
+                      {(selection.text ||
+                        (analysis && analysis.kind !== "overview")) && (
+                        <div className="personal-note">
+                          <label>
+                            我的筆記
+                            <textarea
+                              placeholder="記下你對這個語境的理解…"
+                              value={draftNote}
+                              onChange={(e) => setDraftNote(e.target.value)}
+                              maxLength={100000}
+                            />
+                          </label>
+                          <input
+                            placeholder="標籤，以逗號分隔"
+                            aria-label="收藏標籤"
+                            value={draftTags}
+                            onChange={(e) => setDraftTags(e.target.value)}
+                          />
+                          <button
+                            className="primary full"
+                            onClick={() => void star(analysis?.result.items[0])}
+                          >
+                            ☆ 收藏並保存筆記
+                          </button>
+                        </div>
+                      )}
+                      {!!history.filter((a) => a.kind !== "translation")
+                        .length && (
+                        <div className="history">
+                          <h4>這篇文章的解析紀錄</h4>
+                          {history
+                            .filter((a) => a.kind !== "translation")
+                            .map((a) => (
+                              <button
+                                key={a.id}
+                                onClick={() => {
+                                  setAnalysis(a);
+                                  setSelection({
+                                    text: a.selection,
+                                    start: a.start,
+                                    end: a.end,
+                                    sentence: a.selection,
+                                  });
+                                  setDraftNote("");
+                                  setDraftTags("");
+                                }}
+                              >
+                                <span>{labels[a.kind]}</span>
+                                {a.selection || "全文摘要與學習項目"}
+                              </button>
+                            ))}
+                        </div>
+                      )}
+                    </div>
+                  </aside>
+                </div>
+                <div
+                  className="translation-panel"
+                  id="reading-translation"
+                  role="tabpanel"
+                  aria-labelledby="tab-translation"
+                  hidden={readerMode !== "translation"}
+                >
+                  <TranslationView
+                    key={article.id}
+                    article={article}
+                    history={history}
+                    model={prefs.model}
+                    busy={busy}
+                    translating={busy && lastKind === "translation"}
+                    completed={translatedCount}
+                    error={translationError}
+                    onGenerate={() => void translateArticle()}
+                    onCancel={cancelCurrentAnalysis}
+                  />
+                </div>
               </>
             ) : (
               <div className="welcome">
@@ -964,12 +1265,12 @@ export default function App() {
                 <span className="eyebrow">ONE ARTICLE, A LITTLE FURTHER.</span>
                 <h2>讀原文，累積自己的理解。</h2>
                 <p>
-                  貼上感興趣的英文文章，以自己的步調閱讀。
+                  從左側「最近閱讀」繼續，或用「管理文章」找回已保存的原文。
                   <br />
                   讓每一個字詞，回到它所在的語境。
                 </p>
                 <button className="primary" onClick={() => setAdding(true)}>
-                  ＋ 貼上第一篇文章
+                  ＋ 新增閱讀文章
                 </button>
                 <div className="welcome-features">
                   <span>▤ 原文完整保留</span>

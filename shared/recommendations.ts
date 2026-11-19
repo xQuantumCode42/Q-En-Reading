@@ -92,6 +92,7 @@ export const dailyRecommendationSchema = z
 export type DailyRecommendation = z.infer<typeof dailyRecommendationSchema>;
 export const articleBookmarkSchema = z
   .object({
+    articleId: z.string().uuid().nullable().optional(),
     url: urlSchema,
     title: z.string().trim().min(1).max(400),
     reasonChinese: z.string().max(1000),

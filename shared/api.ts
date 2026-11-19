@@ -34,6 +34,8 @@ export type Snapshot = {
   recommendationSettings: RecommendationSettings;
   recommendation: RecommendationState;
   articleBookmarks: ArticleBookmark[];
+  recentReading: { id: string; openedAt: string }[];
+  translationProgress: Record<string, { completed: number; total: number }>;
 };
 export interface API {
   snapshot(): Promise<Snapshot>;
@@ -45,12 +47,15 @@ export interface API {
   bookmarkRecommendation(day: string): Promise<ArticleBookmark>;
   deleteArticleBookmark(url: string): Promise<void>;
   openArticleBookmark(url: string): Promise<void>;
+  linkArticleBookmark(input: { url: string; articleId: string }): Promise<void>;
   addArticle(input: {
     title: string;
     source: string;
     body: string;
   }): Promise<Article>;
   cancelArticleImport(): Promise<void>;
+  touchReading(id: string): Promise<{ id: string; openedAt: string }[]>;
+  clearRecentReading(): Promise<void>;
   renameArticle(input: { id: string; title: string }): Promise<void>;
   deleteArticle(id: string): Promise<void>;
   position(input: { id: string; position: number }): Promise<void>;

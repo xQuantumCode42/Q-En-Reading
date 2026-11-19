@@ -61,7 +61,7 @@ export async function downloadArticlePage(
         lookup,
         family: address.family,
         headers: {
-          "User-Agent": "ReadingDesk/1.1.1 (public article reader)",
+          "User-Agent": "ReadingDesk/1.2.0 (public article reader)",
           Accept: "text/html,application/xhtml+xml",
           "Accept-Encoding": "gzip, deflate, br",
         },

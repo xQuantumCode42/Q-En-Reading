@@ -29,7 +29,9 @@ async function installFixtures() {
     const importer = loader("./dist-electron/electron/article-import.js");
     globalThis.importHang = false;
     globalThis.importFail = false;
+    globalThis.testImportCalls = 0;
     importer.ArticleImporter.prototype.import = async (url, signal) => {
+      globalThis.testImportCalls++;
       if (globalThis.importHang) return new Promise(() => {});
       if (globalThis.importFail)
         throw new Error("Unable to import public article fixture");
@@ -37,7 +39,9 @@ async function installFixtures() {
         "The proposal gained traction among residents. Reading in context helps build understanding. Communities have worked together to plant trees and make their streets cooler during the summer. The project gives neighbors new opportunities to care for the places they share.";
       return importer.extractArticleInWorker(
         `<html><head><title>Imported public article</title></head><body><article><h1>Imported public article</h1><p>${text}</p><p>${text}</p><p>${text}</p></article></body></html>`,
-        url,
+        url.includes("daily-reading-fixture")
+          ? "https://www.npr.org/sections/science/redirected-fixture"
+          : url,
         signal,
       );
     };
@@ -64,6 +68,10 @@ async function installFixtures() {
       await network(callback);
     };
     globalThis.testAICalls = 0;
+    globalThis.testAnalysisDelay = false;
+    globalThis.testTranslationCalls = 0;
+    globalThis.testTranslationFail = false;
+    globalThis.testTranslationHang = false;
     globalThis.testSearchCalls = 0;
     globalThis.testRefreshFail = false;
     globalThis.testRefreshHang = false;
@@ -185,7 +193,20 @@ async function installFixtures() {
         );
       }
       globalThis.testAICalls++;
+      if (globalThis.testAnalysisDelay)
+        await new Promise((resolve) => setTimeout(resolve, 500));
       const input = JSON.parse(request.input[0].content);
+      if (input.mode === "translation") {
+        globalThis.testTranslationCalls++;
+        if (globalThis.testTranslationHang) return new Promise(() => {});
+        if (
+          globalThis.testTranslationFail &&
+          globalThis.testTranslationCalls > 1
+        )
+          throw new Error("Translation fixture failure");
+        if (input.selection !== "" || input.article.length > 4000)
+          throw new Error("Invalid translation context fixture");
+      }
       const item = {
         term: "gained traction",
         originalSentence: "The proposal gained traction among residents.",
@@ -250,19 +271,24 @@ async function installFixtures() {
                     {
                       type: "output_text",
                       text: JSON.stringify(
-                        input.mode === "word"
-                          ? toWire(result.items[0])
-                          : input.mode === "sentence"
-                            ? {
-                                translation: result.translation,
-                                structure: result.structure,
-                                idioms: result.idioms,
-                                tone: result.tone,
-                              }
-                            : {
-                                summary: result.summary,
-                                items: result.items.map(toWire),
-                              },
+                        input.mode === "translation"
+                          ? {
+                              translation:
+                                "這項提案開始獲得居民支持。透過語境閱讀可以增進理解。這是完整段落翻譯測試。",
+                            }
+                          : input.mode === "word"
+                            ? toWire(result.items[0])
+                            : input.mode === "sentence"
+                              ? {
+                                  translation: result.translation,
+                                  structure: result.structure,
+                                  idioms: result.idioms,
+                                  tone: result.tone,
+                                }
+                              : {
+                                  summary: result.summary,
+                                  items: result.items.map(toWire),
+                                },
                       ),
                     },
                   ],
@@ -306,6 +332,32 @@ async function installFixtures() {
       element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
     });
     await page.getByRole("button", { name: "字詞解析", exact: true }).click();
+    assert.deepEqual(await page.getByRole("tab").allTextContents(), [
+      "原文閱讀",
+      "全文中文對照",
+      "文章解析",
+    ]);
+    assert.equal(
+      await page
+        .getByRole("tab", { name: "文章解析", exact: true })
+        .getAttribute("aria-selected"),
+      "true",
+    );
+    assert.equal(await page.locator(".original-text").isVisible(), true);
+    const splitBounds = await page.locator(".reader").evaluate((e) => ({
+      left: e.getBoundingClientRect().left,
+      right: e.getBoundingClientRect().right,
+      width: e.getBoundingClientRect().width,
+    }));
+    const analysisBounds = await page.locator(".inspector").evaluate((e) => ({
+      left: e.getBoundingClientRect().left,
+      width: e.getBoundingClientRect().width,
+    }));
+    assert.ok(
+      splitBounds.width > 350 &&
+        analysisBounds.width > 350 &&
+        splitBounds.right <= analysisBounds.left + 1,
+    );
     await page
       .getByRole("alert")
       .filter({ hasText: "請先到設定使用 ChatGPT 登入" })
@@ -324,6 +376,8 @@ async function installFixtures() {
       .getByRole("status")
       .filter({ hasText: "已加入星號收藏" })
       .waitFor();
+    await page.getByRole("tab", { name: "原文閱讀", exact: true }).click();
+    await page.waitForTimeout(100);
     await page.locator(".reader").evaluate((element) => {
       element.scrollTop = element.scrollHeight * 0.5;
     });
@@ -389,6 +443,12 @@ async function installFixtures() {
       })
       .waitFor();
     assert.equal(await app.evaluate(() => globalThis.testSearchCalls), 1);
+    await page
+      .getByRole("button", {
+        name: "繼續閱讀：Desktop persistence test",
+        exact: true,
+      })
+      .click();
     const aiBeforeBookmark = await app.evaluate(() => globalThis.testAICalls);
     await page.getByRole("button", { name: "☆ 收藏文章", exact: true }).click();
     await page
@@ -465,6 +525,33 @@ async function installFixtures() {
     await page.getByRole("heading", { name: "摘要 SUMMARY" }).waitFor();
     assert.equal(await page.locator(".learning-item").count(), 8);
     assert.equal(await app.evaluate(() => globalThis.testAICalls), 3);
+    await app.evaluate(() => {
+      globalThis.testAnalysisDelay = true;
+    });
+    const selectWord = async (word) =>
+      page.locator(".original-text").evaluate((element, word) => {
+        const text = element.firstChild;
+        const start = text.textContent.indexOf(word);
+        const range = document.createRange();
+        range.setStart(text, start);
+        range.setEnd(text, start + word.length);
+        const selected = window.getSelection();
+        selected.removeAllRanges();
+        selected.addRange(range);
+        element.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      }, word);
+    await selectWord("proposal");
+    await page.getByRole("button", { name: "字詞解析", exact: true }).click();
+    await selectWord("Reading");
+    await page.waitForTimeout(800);
+    assert.equal(
+      await page.locator(".selection-box blockquote").innerText(),
+      "Reading",
+    );
+    assert.equal(await page.locator(".analysis-result").count(), 0);
+    await app.evaluate(() => {
+      globalThis.testAnalysisDelay = false;
+    });
     // A stalled transport must remain cancellable through the real UI and IPC.
     await app.evaluate(() => {
       globalThis.savedFixtureFetch = globalThis.fetch;
@@ -496,8 +583,17 @@ async function installFixtures() {
       .filter({ hasText: "gained traction" })
       .waitFor();
     await page.screenshot({ path: path.join(directory, "reading.png") });
+    await page.screenshot({
+      path: path.join(directory, "analysis-comparison.png"),
+    });
+    await page.locator(".recent-reading summary").click();
     await app.close();
     page = await launch();
+    assert.equal(
+      await page.locator(".recent-reading").getAttribute("open"),
+      null,
+    );
+    await page.locator(".recent-reading summary").click();
     await page
       .getByRole("button", { name: "★ 已收藏文章", exact: true })
       .waitFor();
@@ -520,8 +616,9 @@ async function installFixtures() {
       ),
       true,
     );
+    await page.getByRole("button", { name: "管理文章", exact: true }).click();
     await page
-      .getByRole("button")
+      .locator(".library-manager .article-open")
       .filter({
         has: page.getByText("Desktop persistence test", { exact: true }),
       })
@@ -699,7 +796,7 @@ async function installFixtures() {
     await page.screenshot({
       path: path.join(directory, "article-bookmarks.png"),
     });
-    await page.getByRole("button", { name: "開啟原文", exact: true }).click();
+    await page.getByRole("button", { name: "瀏覽器原文", exact: true }).click();
     assert.equal(
       await app.evaluate(() => globalThis.testArticleUrl),
       "https://www.npr.org/sections/science/daily-reading-fixture",
@@ -737,6 +834,7 @@ async function installFixtures() {
       .waitFor();
     await page.getByRole("button", { name: /文章庫/ }).click();
     const card = page.locator(".daily-card");
+    assert.equal(await page.locator(".library-manager").count(), 0);
     await card.getByRole("button", { name: "☆ 收藏文章", exact: true }).click();
     await card
       .getByRole("button", { name: "★ 已收藏文章", exact: true })
@@ -818,6 +916,214 @@ async function installFixtures() {
     await installFixtures();
     await page.evaluate(() => window.readingDesk.recommendation(true));
     assert.equal(await app.evaluate(() => globalThis.testSearchCalls), 0);
+    await page.getByRole("button", { name: "管理文章", exact: true }).click();
+    await page
+      .locator(".library-manager .article-open")
+      .filter({ hasText: "Desktop persistence test" })
+      .click();
+    const articleCountBeforeClear = await page.evaluate(
+      async () => (await window.readingDesk.snapshot()).articles.length,
+    );
+    const expandedWidth = await page
+      .locator(".sidebar")
+      .evaluate((e) => e.getBoundingClientRect().width);
+    await page.locator(".recent-reading summary").click();
+    assert.equal(
+      await page.locator(".recent-reading").getAttribute("open"),
+      null,
+    );
+    await page.locator(".recent-reading summary").click();
+    assert.ok(expandedWidth <= 180);
+    const readingWidth = await page
+      .locator(".reader")
+      .evaluate((e) => e.getBoundingClientRect().width);
+    assert.ok(readingWidth > 900);
+    await page
+      .getByRole("button", { name: "收起側邊選單", exact: true })
+      .click();
+    assert.ok(
+      (await page
+        .locator(".sidebar")
+        .evaluate((e) => e.getBoundingClientRect().width)) < 65,
+    );
+    await page.screenshot({
+      path: path.join(directory, "reading-collapsed.png"),
+    });
+    await page
+      .getByRole("button", { name: "展開側邊選單", exact: true })
+      .click();
+    await page.getByRole("tab", { name: "全文中文對照", exact: true }).click();
+    assert.equal(await app.evaluate(() => globalThis.testTranslationCalls), 0);
+    await app.evaluate(() => {
+      globalThis.testTranslationFail = true;
+    });
+    await page
+      .getByRole("button", { name: "產生全文中文翻譯", exact: true })
+      .click();
+    await page
+      .getByRole("alert")
+      .filter({ hasText: "Translation fixture failure" })
+      .waitFor();
+    const savedPartial = await page.evaluate(
+      async () =>
+        (
+          await window.readingDesk.history(
+            (await window.readingDesk.snapshot()).articles.find(
+              (a) => a.title === "Desktop persistence test",
+            ).id,
+          )
+        ).filter((a) => a.kind === "translation").length,
+    );
+    assert.equal(savedPartial, 1);
+    await app.evaluate(() => {
+      globalThis.testTranslationFail = false;
+    });
+    await page
+      .getByRole("button", { name: "繼續全文翻譯", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "全文翻譯已保存", exact: true })
+      .waitFor();
+    assert.ok((await page.locator(".translation-pair").count()) > 1);
+    const callsAfterTranslation = await app.evaluate(
+      () => globalThis.testTranslationCalls,
+    );
+    assert.equal(
+      callsAfterTranslation,
+      (await page.locator(".translation-pair").count()) + 1,
+    );
+    await page.screenshot({
+      path: path.join(directory, "translation-bilingual.png"),
+    });
+    await page.getByRole("button", { name: "只看中文", exact: true }).click();
+    assert.equal(await page.locator(".translation-original").count(), 0);
+    const translatedBackup = path.join(directory, "translated-backup.json");
+    await app.evaluate(({ dialog }, file) => {
+      dialog.showSaveDialog = async () => ({ canceled: false, filePath: file });
+    }, translatedBackup);
+    await page.evaluate(() => window.readingDesk.exportBackup());
+    assert.ok(
+      JSON.parse(fs.readFileSync(translatedBackup, "utf8")).analyses.some(
+        (a) => a.kind === "translation",
+      ),
+    );
+    await page.getByRole("button", { name: "清空", exact: true }).click();
+    await page.getByText("開啟文章後會出現在這裡。", { exact: true }).waitFor();
+    assert.equal(
+      await page.evaluate(
+        async () => (await window.readingDesk.snapshot()).articles.length,
+      ),
+      articleCountBeforeClear,
+    );
+    await app.close();
+    page = await launch();
+    await installFixtures();
+    await page.getByRole("button", { name: "管理文章", exact: true }).click();
+    await page
+      .locator(".library-manager .article-open")
+      .filter({ hasText: "Desktop persistence test" })
+      .click();
+    await page.getByRole("tab", { name: "全文中文對照", exact: true }).click();
+    await page
+      .getByRole("button", { name: "全文翻譯已保存", exact: true })
+      .waitFor();
+    assert.equal(await app.evaluate(() => globalThis.testTranslationCalls), 0);
+    await page.getByRole("button", { name: "文章庫", exact: true }).click();
+    await page.getByRole("button", { name: "管理文章", exact: true }).click();
+    await page
+      .locator(".library-manager .article-open")
+      .filter({ hasText: "Imported public article" })
+      .click();
+    await page.getByRole("tab", { name: "全文中文對照", exact: true }).click();
+    await app.evaluate(() => {
+      globalThis.testTranslationHang = true;
+    });
+    await page
+      .getByRole("button", { name: "產生全文中文翻譯", exact: true })
+      .click();
+    await page.getByRole("button", { name: "取消翻譯", exact: true }).click();
+    await page.getByRole("alert").filter({ hasText: "取消" }).waitFor();
+    await page
+      .getByRole("button", { name: "產生全文中文翻譯", exact: true })
+      .waitFor();
+    await app.evaluate(() => {
+      globalThis.testTranslationHang = false;
+    });
+    await page.getByRole("button", { name: "星號收藏", exact: true }).click();
+    await page.getByRole("button", { name: /文章收藏（/ }).click();
+    const importsBeforeReopen = await app.evaluate(
+      () => globalThis.testImportCalls,
+    );
+    await page
+      .getByRole("button", { name: "開啟已保存文章", exact: true })
+      .click();
+    await page.getByRole("tab", { name: "全文中文對照", exact: true }).click();
+    await page
+      .getByRole("button", { name: "產生全文中文翻譯", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "全文翻譯已保存", exact: true })
+      .waitFor();
+    const savedId = await page.evaluate(
+      async () =>
+        (await window.readingDesk.snapshot()).articleBookmarks[0].articleId,
+    );
+    assert.equal(
+      await app.evaluate(() => globalThis.testImportCalls),
+      importsBeforeReopen,
+    );
+    await page.getByRole("button", { name: "星號收藏", exact: true }).click();
+    await page.getByText("中文翻譯已保存 1／1 段", { exact: true }).waitFor();
+    await page.evaluate(async () => {
+      const s = await window.readingDesk.snapshot();
+      await window.readingDesk.settings({
+        preferences: { ...s.preferences, model: "changed-model-fixture" },
+      });
+    });
+    await app.close();
+    page = await launch();
+    await installFixtures();
+    await page.getByRole("button", { name: "星號收藏", exact: true }).click();
+    await page.getByRole("button", { name: /文章收藏（/ }).click();
+    await page.getByText("中文翻譯已保存 1／1 段", { exact: true }).waitFor();
+    await page
+      .getByRole("button", { name: "開啟已保存文章", exact: true })
+      .click();
+    await page
+      .getByRole("button", { name: "全文翻譯已保存", exact: true })
+      .waitFor();
+    assert.equal(
+      await page.getByLabel("翻譯版本", { exact: true }).inputValue(),
+      "fixture-subscription-model",
+    );
+    assert.equal(await app.evaluate(() => globalThis.testTranslationCalls), 0);
+    assert.equal(await app.evaluate(() => globalThis.testImportCalls), 0);
+    assert.equal(
+      await page.evaluate(
+        async () => (await window.readingDesk.snapshot()).preferences.model,
+      ),
+      "changed-model-fixture",
+    );
+    assert.equal(
+      await page.evaluate(
+        async () =>
+          (await window.readingDesk.snapshot()).articleBookmarks[0].articleId,
+      ),
+      savedId,
+    );
+    await page.screenshot({
+      path: path.join(directory, "saved-bookmark-translation.png"),
+    });
+    await page.getByRole("button", { name: "星號收藏", exact: true }).click();
+    await page.getByRole("button", { name: "變更連結", exact: true }).click();
+    await page
+      .getByLabel("選擇已保存文章", { exact: true })
+      .selectOption(savedId);
+    await page.getByRole("button", { name: "連結並開啟", exact: true }).click();
+    await page
+      .getByRole("button", { name: "全文翻譯已保存", exact: true })
+      .waitFor();
+    assert.equal(await app.evaluate(() => globalThis.testTranslationCalls), 0);
     await page.getByRole("button", { name: /設定/ }).click();
     await page.getByRole("button", { name: "登出", exact: true }).click();
     await page
@@ -825,7 +1131,7 @@ async function installFixtures() {
       .filter({ hasText: "尚未登入 ChatGPT" })
       .waitFor();
     console.log(
-      "PASS: Electron OAuth/subscription/search/citations/daily cache/manual refresh/exclusions/same URL rejection/failure/cancel/reopen/model picker/SSE/cache/sign-out/encryption/article/favorite/note/position/backup/security/URL import/analysis/failure/cancel/article bookmarks/reopen/dedup/backup/import/remove",
+      "PASS: Electron OAuth/subscription/search/citations/daily cache/manual refresh/exclusions/same URL rejection/failure/cancel/reopen/model picker/SSE/cache/sign-out/encryption/article/favorite/note/position/backup/security/URL import/article bookmarks/redirect linked translation/model-independent saved versions/no reimport or inference on reopen/analysis split/recents/translation resume/backup/cancel",
     );
     console.log("Artifacts:", directory);
   } finally {

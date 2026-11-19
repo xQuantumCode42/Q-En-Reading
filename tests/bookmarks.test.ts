@@ -3,6 +3,80 @@ import assert from "node:assert/strict";
 import { Store } from "../electron/store";
 import { dailyRecommendationSchema } from "../shared/recommendations";
 import { backupSchema } from "../shared/schema";
+import { randomUUID } from "node:crypto";
+import { savedTranslations } from "../shared/translation";
+
+test("redirected bookmark resolves a fixed local article, translation remains visible after changing models and restore", () => {
+  const store = new Store(":memory:");
+  const target = new Store(":memory:");
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  try {
+    store.saveArticleBookmark(recommendation);
+    store.put("article", {
+      id,
+      title: "Test",
+      source: "https://example.com/final",
+      importedFrom: recommendation.url,
+      body: "An article.",
+      position: 0,
+      createdAt: now,
+      updatedAt: now,
+    });
+    store.put("analysis", {
+      id: randomUUID(),
+      articleId: id,
+      kind: "translation",
+      selection: "An article.",
+      start: 0,
+      end: 11,
+      model: "old-model",
+      createdAt: now,
+      result: {
+        summary: "",
+        translation: "一篇文章。",
+        structure: "",
+        idioms: "",
+        tone: "",
+        items: [],
+      },
+    });
+    const linked = store.articleBookmarks()[0];
+    assert.equal(linked.articleId, id);
+    const saved = savedTranslations(
+      "An article.",
+      store.list("analysis"),
+      "new-model",
+    );
+    assert.equal(saved.selectedModel, "old-model");
+    assert.equal(saved.saved.filter(Boolean).length, 1);
+    store.remove("article-bookmark", recommendation.url);
+    const existing = store.get<any>("article", id)!;
+    delete existing.importedFrom;
+    store.put("article", existing);
+    store.saveArticleBookmark(recommendation);
+    assert.equal(store.articleBookmarks()[0].articleId, undefined);
+    store.linkArticleBookmark(recommendation.url, id);
+    assert.equal(store.articleBookmarks()[0].articleId, id);
+    const backup = store.backup();
+    target.restore(backup, "merge");
+    target.restore(backup, "merge");
+    const reopened = target.articleBookmarks()[0];
+    assert.ok(target.get("article", reopened.articleId!));
+    assert.equal(
+      target
+        .list<any>("analysis")
+        .filter((a) => a.articleId === reopened.articleId).length,
+      1,
+    );
+    store.deleteArticle(id);
+    assert.equal(store.articleBookmarks()[0].articleId, null);
+    assert.doesNotThrow(() => store.backup());
+  } finally {
+    store.close();
+    target.close();
+  }
+});
 
 const recommendation = dailyRecommendationSchema.parse({
   day: "2026-11-18",

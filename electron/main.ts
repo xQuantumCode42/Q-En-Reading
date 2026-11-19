@@ -154,7 +154,9 @@ function registerHandlers() {
   register("snapshot", z.undefined(), async () => ({
     articles: store.list<Article>("article"),
     favorites: store.list<Favorite>("favorite"),
-    articleBookmarks: store.list<ArticleBookmark>("article-bookmark"),
+    articleBookmarks: store.articleBookmarks(),
+    translationProgress: store.translationProgress(),
+    recentReading: store.recentReading(),
     preferences: store.preferences(),
     chatGPT: await auth.session(),
     dataPath: app.getPath("userData"),
@@ -164,6 +166,8 @@ function registerHandlers() {
   register("recommendation:run", z.boolean(), (retry) =>
     recommendations.ensure(retry),
   );
+  register("reading:touch", id, (articleId) => store.touchReading(articleId));
+  register("reading:clear", z.undefined(), () => store.clearRecentReading());
   register("recommendation:refresh", z.undefined(), () =>
     recommendations.refresh(),
   );
@@ -181,6 +185,13 @@ function registerHandlers() {
   );
   register("article-bookmark:delete", z.string().max(2000), (url) =>
     store.remove("article-bookmark", publicUrl(url)),
+  );
+  register(
+    "article-bookmark:link",
+    z.object({ url: z.string().max(2000), articleId: id }).strict(),
+    (input) => {
+      store.linkArticleBookmark(input.url, input.articleId);
+    },
   );
   register("article-bookmark:open", z.string().max(2000), (url) => {
     const bookmark = store.get<ArticleBookmark>(
@@ -230,6 +241,7 @@ function registerHandlers() {
     }
     const a: Article = articleSchema.parse({
       ...content,
+      ...(!input.body.trim() ? { importedFrom: publicUrl(input.source) } : {}),
       id: randomUUID(),
       position: 0,
       createdAt: now(),
@@ -300,7 +312,9 @@ function registerHandlers() {
             a.model === model,
         );
       if (cached) return cached;
-      if (article.body.length > 60000)
+      if (kind === "translation" && selection.length > 4000)
+        throw new Error("翻譯需分成最多 4,000 字元的段落。");
+      if (kind !== "translation" && article.body.length > 60000)
         throw new Error(
           "AI 解析目前支援最多 60,000 字元，請將文章分篇；閱讀及儲存仍可使用。",
         );
